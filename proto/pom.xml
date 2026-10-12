@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cs324</groupId>
+        <artifactId>cs324-distributed-system</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>proto</artifactId>
+    <name>CS324 Protobuf / gRPC contracts</name>
+    <description>Single source of truth: cluster.proto plus the generated gRPC stubs and shared configuration.</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-protobuf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>io.grpc</groupId>
+            <artifactId>grpc-stub</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>javax.annotation</groupId>
+            <artifactId>javax.annotation-api</artifactId>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
+                <executions>
+                    <!--
+                        The generated package root must sit directly under
+                        target/generated-sources/ so that IDEs (IntelliJ IDEA's
+                        "Generated sources folders" auto-detection, Eclipse m2e)
+                        mark it as a source root. The plugin default nests the
+                        output two levels deep (generated-sources/protobuf/java
+                        and .../grpc-java), which the IDE then treats as a wrong
+                        package prefix and resolves no gRPC classes.
+                    -->
+                    <execution>
+                        <id>protobuf-java</id>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/generated-sources/protobuf-java</outputDirectory>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>protobuf-grpc</id>
+                        <goals>
+                            <goal>compile-custom</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/generated-sources/protobuf-grpc</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
