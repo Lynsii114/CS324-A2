@@ -45,6 +45,35 @@
             <plugin>
                 <groupId>org.xolstice.maven.plugins</groupId>
                 <artifactId>protobuf-maven-plugin</artifactId>
+                <executions>
+                    <!--
+                        The generated package root must sit directly under
+                        target/generated-sources/ so that IDEs (IntelliJ IDEA's
+                        "Generated sources folders" auto-detection, Eclipse m2e)
+                        mark it as a source root. The plugin default nests the
+                        output two levels deep (generated-sources/protobuf/java
+                        and .../grpc-java), which the IDE then treats as a wrong
+                        package prefix and resolves no gRPC classes.
+                    -->
+                    <execution>
+                        <id>protobuf-java</id>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/generated-sources/protobuf-java</outputDirectory>
+                        </configuration>
+                    </execution>
+                    <execution>
+                        <id>protobuf-grpc</id>
+                        <goals>
+                            <goal>compile-custom</goal>
+                        </goals>
+                        <configuration>
+                            <outputDirectory>${project.build.directory}/generated-sources/protobuf-grpc</outputDirectory>
+                        </configuration>
+                    </execution>
+                </executions>
             </plugin>
         </plugins>
     </build>
