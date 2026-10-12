@@ -20,16 +20,15 @@ JVM.
 
 1. [What the Program Does](#what-the-program-does)
 2. [Project Layout](#project-layout)
-3. [System Architecture](#system-architecture)
-4. [Requirements & Tools](#requirements--tools)
-5. [Configuration](#configuration)
-6. [Building the Project](#building-the-project)
-7. [Running the Entire System — Option A (One Terminal Command, Recommended)](#running-the-entire-system-option-a-one-terminal-command-recommended)
-8. [Running the Entire System — Option B (Manual or Separate Terminals)](#running-the-entire-system-option-b-manual-or-separate-terminals)
-9. [Job Types & Input Formats](#job-types--input-formats)
-10. [How the Cluster Works (Election, Tasks, Terms)](#how-the-cluster-works)
-11. [Stopping the Cluster](#stopping-the-cluster)
-12. [Troubleshooting](#troubleshooting)
+3. [Requirements & Tools](#requirements--tools)
+4. [Configuration](#configuration)
+5. [Building the Project](#building-the-project)
+6. [Running the Entire System — Option A (One Terminal Command, Recommended)](#running-the-entire-system-option-a-one-terminal-command-recommended)
+7. [Running the Entire System — Option B (Manual or Separate Terminals)](#running-the-entire-system-option-b-manual-or-separate-terminals)
+8. [Job Types & Input Formats](#job-types--input-formats)
+9. [How the Cluster Works (Election, Tasks, Terms)](#how-the-cluster-works)
+10. [Stopping the Cluster](#stopping-the-cluster)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -78,30 +77,6 @@ The `worker`, `bootstrap` and `client` modules are built as **self-contained exe
 - The client finds the current coordinator through the Bootstrap Node automatically.
 
 ---
-
-## System Architecture
-
-```
-    +----------------------+          gRPC (cs324.BootstrapService)
-    |   Bootstrap Node     |<--------------------------------------+
-    |   :1099              |<-------------------------------+      |
-    +----------------------+                                |      |
-            ^  launches all workers at startup              |      |
-            |                                               |      |
-   +--------+--------+   gRPC peer-to-peer (cs324.WorkerService)  |
-   |                 |<-----------------------------------------> |
-   v                 v                                            |
-+---------+   +---------+   +---------+   +---------+   +---------+
-| Worker1 |   | Worker2 |   | Worker3 |   | Worker4 |   | WorkerN |   (each its own JVM,
-| :5001   |   | :5002   |   | :5003   |   | :5004   |   | :5000+N |    its own gRPC port)
-+---------+   +---------+   +---------+   +---------+   +---------+
-      ^                                                        
-      |  gRPC job submission (to the elected coordinator)
-      |
-+-------------+        +-------------+
-|  Client GUI |        |  Client GUI |   (any number of clients, run as separate JVMs)
-+-------------+        +-------------+
-```
 
 ---
 
