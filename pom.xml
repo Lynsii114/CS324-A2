@@ -75,6 +75,21 @@
     </dependencyManagement>
 
     <build>
+        <extensions>
+            <!--
+                Sets ${os.detected.classifier} (and friends) used by the
+                protobuf plugin below to pick the platform specific protoc and
+                protoc-gen-grpc-java executables. Declared here (not only in the
+                proto module) so the property resolves everywhere - including in
+                this parent POM, where the IDE otherwise reports
+                "Cannot resolve symbol 'os.detected.classifier'".
+            -->
+            <extension>
+                <groupId>kr.motd.maven</groupId>
+                <artifactId>os-maven-plugin</artifactId>
+                <version>${os.plugin.version}</version>
+            </extension>
+        </extensions>
         <pluginManagement>
             <plugins>
                 <plugin>
