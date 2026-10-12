@@ -1,6 +1,6 @@
 # Distributed Computing Cluster (CS324)
 
-A distributed computing cluster built with **Java RMI**. At least six independent worker JVMs
+A distributed computing cluster built with **gRPC** (Java). At least six independent worker JVMs
 (extra nodes can be added at startup) form an unstructured network, a neutral **Bootstrap Node**
 tracks membership, and a distributed **leader election** lets the workers agree on a
 **Coordinator** for one term at a time. Clients submit jobs
@@ -10,30 +10,35 @@ worker **nodes** (never executing a segment itself), merges the partial results,
 which workers processed the task, and returns the compiled answer plus the used-worker list to the
 requesting client.
 
+The whole communication layer is defined once in a **Protocol Buffers** contract
+(`proto/src/main/proto/cluster.proto`); every component is a separate Maven module and a separate
+JVM.
+
 ---
 
 ## Table of Contents
 
 1. [What the Program Does](#what-the-program-does)
-2. [System Architecture](#system-architecture)
-3. [Requirements & Tools](#requirements--tools)
-4. [Configuration](#configuration)
-5. [Building the Project](#building-the-project)
-6. [Running the Entire System — Option A (One Terminal Command, Recommended)](#running-the-entire-system-option-a-one-terminal-command-recommended)
-7. [Running the Entire System — Option B (Manual or Separate Terminals)](#running-the-entire-system-option-b-manual-or-separate-terminals)
-8. [Job Types & Input Formats](#job-types--input-formats)
-9. [How the Cluster Works (Election, Tasks, Terms)](#how-the-cluster-works)
-10. [Stopping the Cluster](#stopping-the-cluster)
-11. [Troubleshooting](#troubleshooting)
+2. [Project Layout](#project-layout)
+3. [System Architecture](#system-architecture)
+4. [Requirements & Tools](#requirements--tools)
+5. [Configuration](#configuration)
+6. [Building the Project](#building-the-project)
+7. [Running the Entire System — Option A (One Terminal Command, Recommended)](#running-the-entire-system-option-a-one-terminal-command-recommended)
+8. [Running the Entire System — Option B (Manual or Separate Terminals)](#running-the-entire-system-option-b-manual-or-separate-terminals)
+9. [Job Types & Input Formats](#job-types--input-formats)
+10. [How the Cluster Works (Election, Tasks, Terms)](#how-the-cluster-works)
+11. [Stopping the Cluster](#stopping-the-cluster)
+12. [Troubleshooting](#troubleshooting)
 
 ---
 
 ## What the Program Does
 
 - At least six **worker nodes** (IDs `1..N`, six by default, minimum six) each run in their own JVM
-  with their own RMI registry and port.
-- A **Bootstrap Node** keeps the membership list — it never runs jobs and never takes part in
-  elections.
+  with their own **gRPC server and port**.
+- A **Bootstrap Node** keeps the membership list over gRPC — it never runs jobs and never takes part
+  in elections.
 - The workers **elect a Coordinator** automatically. On startup a randomized timer lottery picks an
   initial coordinator; afterwards the coordinator serves **at most 5 client jobs**, then a new
   election chooses the **lowest-JAC** worker (JAC = lifetime job-allocation counter).
@@ -51,19 +56,61 @@ client GUI handles job submission.
 
 ---
 
-- **RMI contracts & Data Transfer Objects** live in `com.cs324.backend.api` (`WorkerService`, `BootstrapService`,
-  `TaskResult`, election messages).
+## Project Layout
+
+The project is a multi-module Maven build. The gRPC/protobuf contract is generated once in `proto`
+and consumed by every other module as a normal Maven dependency.
+
+| Module | What it contains | Artifact |
+|--------|------------------|----------|
+| `proto` | The `.proto` blueprint, generated gRPC stubs, and the shared config/helpers in `com.cs324.common` (`WorkerClusterConfig`, `GrpcSupport`, `ChannelPool`). | `proto/target/proto-1.0-SNAPSHOT.jar` |
+| `worker` | A worker node: `WorkerServiceImpl` (election + task execution), `WorkerServer` (entry point), `WorkerClusterLauncher` (spawns N workers as JVMs). | `worker/target/worker.jar` (fat jar) |
+| `bootstrap` | The Bootstrap Node: `BootstrapServiceImpl` (membership), `BootstrapServer` (starts the gRPC server and launches all workers). | `bootstrap/target/bootstrap.jar` (fat jar) |
+| `client` | The client GUI (`ClientGUI`) plus its Swing theme (`UITheme`). | `client/target/client.jar` (fat jar) |
+
+The `worker`, `bootstrap` and `client` modules are built as **self-contained executable fat jars**
+(via `maven-shade-plugin`), so no classpath assembly is needed at run time.
+
+- **gRPC contracts** live in `proto/src/main/proto/cluster.proto` (services `cs324.WorkerService`
+  and `cs324.BootstrapService`); generated Java lands under `com.cs324.grpc`.
 - Workers register with the Bootstrap Node and are linked into a small neighbour graph; distributed
   election and job messages still reason over **all reachable active workers**.
 - The client finds the current coordinator through the Bootstrap Node automatically.
 
 ---
 
+## System Architecture
+
+```
+    +----------------------+          gRPC (cs324.BootstrapService)
+    |   Bootstrap Node     |<--------------------------------------+
+    |   :1099              |<-------------------------------+      |
+    +----------------------+                                |      |
+            ^  launches all workers at startup              |      |
+            |                                               |      |
+   +--------+--------+   gRPC peer-to-peer (cs324.WorkerService)  |
+   |                 |<-----------------------------------------> |
+   v                 v                                            |
++---------+   +---------+   +---------+   +---------+   +---------+
+| Worker1 |   | Worker2 |   | Worker3 |   | Worker4 |   | WorkerN |   (each its own JVM,
+| :5001   |   | :5002   |   | :5003   |   | :5004   |   | :5000+N |    its own gRPC port)
++---------+   +---------+   +---------+   +---------+   +---------+
+      ^                                                        
+      |  gRPC job submission (to the elected coordinator)
+      |
++-------------+        +-------------+
+|  Client GUI |        |  Client GUI |   (any number of clients, run as separate JVMs)
++-------------+        +-------------+
+```
+
+---
+
 ## Requirements & Tools
 
-- **JDK 17+** (compiled with `--release 17`; developed and tested on OpenJDK 17–26).
-- **Maven 3.8+**.
-- Any OS with Java + RMI; all examples assume a shell on `localhost`.
+- **JDK 17+** (the build targets `--release 17`).
+- **Maven 3.8+**. The gRPC/protobuf toolchain (`protoc` and `protoc-gen-grpc-java`) is downloaded
+  automatically by the build, so nothing else needs to be installed manually.
+- Any OS with Java; all examples assume a shell on `localhost`.
 
 ---
 
@@ -74,22 +121,22 @@ change host/ports, edit these files:
 
 | Setting | Where | Default |
 |---------|-------|---------|
-| Bootstrap RMI registry port | `BootstrapServer.DEFAULT_PORT` | `1099` |
+| Bootstrap gRPC port | `WorkerClusterConfig.DEFAULT_BOOTSTRAP_PORT` (or `BootstrapServer [port] [workerCount]`) | `1099` |
 | Number of workers | system property `cs324.worker.count` (or `BootstrapServer [port] [workerCount]`) | `6` (minimum `6`) |
 | Worker IDs | `WorkerClusterConfig.FIRST_WORKER_ID` / `LAST_WORKER_ID` | `1` / `N` (N = configured count) |
-| Base worker RMI port (worker *id* → *BASE + id − 1*) | `WorkerClusterConfig.BASE_WORKER_PORT` | `5001` |
+| Base worker gRPC port (worker *id* → *BASE + id − 1*) | `WorkerClusterConfig.BASE_WORKER_PORT` | `5001` |
 | Default host | `WorkerClusterConfig.DEFAULT_HOST` | `localhost` |
 | Worker log directory | `WorkerClusterConfig.LOG_DIR` | `logs` |
-| Max submitted jobs per coordinator term | `WorkerService.COORDINATOR_TERM_LIMIT` | `5` |
+| Max submitted jobs per coordinator term | `WorkerClusterConfig.COORDINATOR_TERM_LIMIT` | `5` |
 | Task segmentation: MAX/PRIMECOUNT items per segment | `WorkerServiceImpl.SEGMENT_NUMBERS` | `3` |
 | Task segmentation: PRIMESUM range length per segment | `WorkerServiceImpl.SEGMENT_RANGE_LENGTH` | `200` |
-| Startup lottery countdown | `WorkerServiceImpl` (Phase 1) | 150–300 ms random |
+| Startup lottery countdown | `WorkerServiceImpl` (`LOTTERY_MIN_DELAY_MS` / `LOTTERY_SPAN_MS`) | 150–300 ms random |
 
 Port layout used by the cluster (fixed, don't run other services on these):
 
 | Component | Address |
 |-----------|---------|
-| Bootstrap Node RMI registry | `localhost:1099` |
+| Bootstrap Node gRPC server | `localhost:1099` |
 | Worker 1 | `localhost:5001` |
 | Worker 2 | `localhost:5002` |
 | Worker 3 | `localhost:5003` |
@@ -108,38 +155,42 @@ sections below) instead of editing source.
 ## Building the Project
 
 ```bash
-mvn clean compile
+mvn clean install
 ```
 
-Compiled classes land in `target/classes`. All launch commands below assume a classpath of
+This builds all four modules in order and installs them into the local repository. The build also
+generates the gRPC stubs from `proto/src/main/proto/cluster.proto` and packages the three
+executable fat jars:
 
-```bash
-java -cp target/classes <fully.qualified.ClassName>
-```
+- `worker/target/worker.jar`
+- `bootstrap/target/bootstrap.jar`
+- `client/target/client.jar`
+
+All launch commands below use `java -jar <module>/target/<name>.jar`.
 
 ---
 
 ## Running the Entire System — Option A (One Terminal Command, Recommended)
 
-There is **no server GUI** anymore. The Bootstrap Node itself launches every worker node in its
-own JVM when it starts, so **one command** runs the whole cluster (no manual startup order).
+There is **no server GUI**. The Bootstrap Node itself launches every worker node in its own JVM when
+it starts, so **one command** runs the whole cluster (no manual startup order).
 
 ### Step 1 — Start the Bootstrap Node (this also starts all workers)
 
 ```bash
-# default cluster: bootstrap RMI registry on port 1099 + the 6 default workers
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
+# default cluster: bootstrap gRPC server on port 1099 + the 6 default workers
+java -jar bootstrap/target/bootstrap.jar
 
 # custom bootstrap port (still the 6 default workers)
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 2099
+java -jar bootstrap/target/bootstrap.jar 2099
 
 # spin up extra worker nodes on top of the default 6 (minimum is 6): 8 workers here
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 1099 8
+java -jar bootstrap/target/bootstrap.jar 1099 8
 ```
 
-The bootstrap binds its RMI registry, spawns one JVM per worker node (IDs `1..N`, RMI ports
+The bootstrap binds its gRPC server, spawns one JVM per worker node (IDs `1..N`, gRPC ports
 `5001..5000+N`, logs `logs/worker-<id>.log`), waits until the configured count has registered and
-verifies each node over RMI. Press **Ctrl+C** (or `kill <pid>`) to stop the whole cluster again.
+verifies each node over gRPC. Press **Ctrl+C** (or `kill <pid>`) to stop the whole cluster again.
 
 ### Step 2 — Wait for the automatic election
 
@@ -155,7 +206,7 @@ bootstrap/worker logs):
 In separate terminals (run any number of client GUIs simultaneously):
 
 ```bash
-java -cp target/classes com.cs324.frontend.client.ClientGUI
+java -jar client/target/client.jar
 ```
 
 Click **Connect**. The client auto-discovers the coordinator through the Bootstrap Node and shows
@@ -184,28 +235,32 @@ Everything is configurable via arguments; only the fixed worker port layout live
 
 ### Step 1 — Start the Bootstrap Node alone
 
+The `bootstrap.jar` always launches workers too. If you want the bootstrap **without** auto-launched
+workers, start it and immediately stop the workers it spawned with the launcher's `stop` command
+(below), or use Option A. To start just the membership server:
+
 ```bash
-# default RMI registry port 1099, no workers launched
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer
+# default gRPC port 1099
+java -jar bootstrap/target/bootstrap.jar
 
 # custom port, e.g. 2099
-java -cp target/classes com.cs324.backend.bootstrap.BootstrapServer 2099
+java -jar bootstrap/target/bootstrap.jar 2099
 ```
 
 ### Step 2 — Start the workers (one JVM each)
 
-Either run `WorkerServer` manually (IDs `1..N`, RMI ports `5001..5000+N`):
+Run `WorkerServer` manually (IDs `1..N`, gRPC ports `5001..5000+N`):
 
 ```bash
-java -cp target/classes com.cs324.backend.worker.WorkerServer 1 5001
-java -cp target/classes com.cs324.backend.worker.WorkerServer 2 5002
-java -cp target/classes com.cs324.backend.worker.WorkerServer 3 5003
-java -cp target/classes com.cs324.backend.worker.WorkerServer 4 5004
-java -cp target/classes com.cs324.backend.worker.WorkerServer 5 5005
-java -cp target/classes com.cs324.backend.worker.WorkerServer 6 5006
+java -jar worker/target/worker.jar 1 5001
+java -jar worker/target/worker.jar 2 5002
+java -jar worker/target/worker.jar 3 5003
+java -jar worker/target/worker.jar 4 5004
+java -jar worker/target/worker.jar 5 5005
+java -jar worker/target/worker.jar 6 5006
 # extra nodes beyond the default six:
-java -cp target/classes com.cs324.backend.worker.WorkerServer 7 5007
-java -cp target/classes com.cs324.backend.worker.WorkerServer 8 5008
+java -jar worker/target/worker.jar 7 5007
+java -jar worker/target/worker.jar 8 5008
 ```
 
 Optional trailing arguments (only needed when something is not on `localhost`):
@@ -223,26 +278,29 @@ within ~10 seconds.
 ### Step 4 — Run the clients
 
 ```bash
-java -cp target/classes com.cs324.frontend.client.ClientGUI
+java -jar client/target/client.jar
 ```
 
 ### Launcher convenience commands (bash, not a GUI)
 
+The launcher lives in the `worker` module; its jar's main class is `WorkerServer`, so invoke the
+launcher class explicitly:
+
 ```bash
 # start the 6 default workers against a bootstrap on localhost:1099
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start
+java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher start
 
 # custom bootstrap
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099
+java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099
 
 # add extra nodes (here a 9-worker cluster): extra nodes spawn on top of the default 6
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099 9
+java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher start localhost 1099 9
 
 # stop all workers started by the launcher, reusing its pid files
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher stop
+java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher stop
 
 # show pid file state for each worker
-java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher status
+java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher status
 ```
 
 ---
@@ -347,7 +405,8 @@ the winner is broadcast to all participants and every worker records the same co
 - **One-command bootstrap (Option A)**: press **Ctrl+C** in the bootstrap terminal (or
   `kill <pid>`). Its shutdown hook unregisters every worker node and stops each worker JVM it
   launched this session.
-- **Launcher**: `java -cp target/classes com.cs324.backend.worker.WorkerClusterLauncher stop`.
+- **Launcher**:
+  `java -cp worker/target/worker.jar com.cs324.backend.worker.WorkerClusterLauncher stop`.
 - **Manual terminals**: `Ctrl+C` the worker terminals, then the Bootstrap terminal.
 - Left-over pid/log files are cleaned automatically or re-detected on the next start.
 
@@ -357,9 +416,10 @@ the winner is broadcast to all participants and every worker records the same co
 
 | Symptom | Fix |
 |---------|-----|
-| `Connection refused` on worker/client start | Start the Bootstrap Node first; check the ports. |
+| `UNAVAILABLE` / connection refused on worker/client start | Start the Bootstrap Node first; check the gRPC ports (1099 and 5001+). |
 | `Worker N is not the coordinator` | A term just ended and a new election is running; resubmit — the client auto-re-resolves the new coordinator. |
 | `Coordinator term ended after 5 jobs ...` | Expected — the term expired; the next submission goes to the new coordinator. |
 | Port already in use | Another instance is running (pid files skip it); stop it first. |
 | GUI shows `ELECTING...` for a long time | Seconds-long is normal right after a term ends. If it persists, stop and restart the workers so they all re-run their staggered auto-election checks. |
-| Server/Client tables look empty | Click **Refresh** or **Connect** (Client) — the client view auto-refreshes while connected. |
+| Client tables look empty | Click **Connect** — the client view auto-refreshes while connected. |
+| Build downloads `protoc` on first run | Expected — the gRPC toolchain is fetched from Maven Central the first time only. |
