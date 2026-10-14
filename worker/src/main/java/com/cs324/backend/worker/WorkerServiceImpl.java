@@ -70,22 +70,22 @@ import java.util.concurrent.atomic.AtomicInteger;
  *       the message to its neighbours (except the hop it came from), and echoes
  *       the merged participant set back. When all echoes return, every reachable
  *       worker has been discovered.</li>
- *   <li>The winner is the reachable worker with the lowest JAC; ties are broken
- *       by the highest startup priority id (minted by the Phase-1 timer lottery),
- *       then the highest worker id as a safety net.</li>
- *   <li>Phase 1: on a fresh cluster the N workers (minimum 6) run a randomized
- *       countdown (150-300 ms); the first to expire claims priority N, the next
- *       N-1, down to 1. All JACs are still 0, so the priority-N worker declares
- *       itself the Initial Coordinator and alerts the other N-1 workers.</li>
+ *   <li>The winner is the reachable worker with the lowest JAC, excluding the
+ *       previous coordinator after a completed term whenever another candidate
+ *       is available; ties use the lowest worker id.</li>
+ *   <li>Phase 1: on a fresh cluster the workers register with Bootstrap, which
+ *       only maintains the active-worker registry. Workers rebuild neighbours
+ *       from that registry and the highest active worker starts the distributed
+ *       ELECTION message; the winner is still selected by the JAC/rotation rule.</li>
  *   <li>Phase 2: the coordinator re-splits each incoming task into a variable
  *       number of contiguous segments (never more than one per worker, sized by
- *       the input) and hands them to the lowest-JAC workers; every worker that
- *       processes a segment has its own JAC incremented.</li>
+ *       the input) and hands them to reachable workers. Each worker that receives
+ *       a segment increments its own JAC.</li>
  *   <li>Phase 3: after 5 submitted jobs the coordinator broadcasts a Term_End
  *       message with the verified JAC table, steps down, and a new election picks
- *       the lowest-JAC worker (tie -> highest priority id).</li>
- *   <li>The result is broadcast to all participants as a
- *       {@link WinnerAnnouncement}, so every worker records the same
+ *       the lowest-JAC worker (ties rotate away from the prior coordinator).</li>
+ *   <li>The result is propagated through the worker network as a COORDINATOR
+ *       {@link WinnerAnnouncement}, so every reachable worker records the same
  *       coordinator.</li>
  *   <li>The Bootstrap Node is never involved beyond looking up the active worker
  *       registry and sequencing lottery claims; it does not participate in the
@@ -98,7 +98,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     private static final Empty EMPTY = Empty.getDefaultInstance();
-
     private final int workerId;
     private final WorkerInfo selfInfo;
     private final String registeredHost;
@@ -110,17 +109,22 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     private final AtomicInteger jobAllocationCounter = new AtomicInteger(0);
     private final AtomicInteger currentCoordinatorId = new AtomicInteger(WorkerClusterConfig.NO_COORDINATOR);
+    private final AtomicInteger previousCoordinatorId = new AtomicInteger(WorkerClusterConfig.NO_COORDINATOR);
     private final Set<String> processedElectionIds = ConcurrentHashMap.newKeySet();
+    private final Set<String> processedCoordinatorAnnouncements = ConcurrentHashMap.newKeySet();
     private final Set<WorkerInfo> neighbours = ConcurrentHashMap.newKeySet();
-    private static final String LEADERMAN = "cs324";
+    private final String leaderman = "cs324";
 
     /**
-     * Number of submitted jobs handled as coordinator during the current term.
-     * Deliberately separate from the JAC: the JAC counts every single job
-     * section a worker processes; this counter counts only complete client jobs
-     * submitted to this worker while it is the term coordinator.
+     * Number of submitted jobs accepted by this coordinator during the current term.
+     * Deliberately separate from the JAC: the JAC counts every job segment this
+     * worker receives; this counter reserves up to five client job slots before
+     * the next election.
      */
     private final AtomicInteger jobsThisTerm = new AtomicInteger(0);
+    private final AtomicInteger completedJobsThisTerm = new AtomicInteger(0);
+    private final AtomicBoolean termEndScheduled = new AtomicBoolean(false);
+    private final AtomicBoolean electionVacancyAuthorized = new AtomicBoolean(true);
 
     private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
 
@@ -138,14 +142,8 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     /** Wall-clock time this worker's randomized countdown expires (Phase 1). */
     private volatile long lotteryFireAt = -1L;
 
-    /** True once the priority-N worker has declared itself the Initial Coordinator. */
-    private volatile boolean declaredInitial = false;
-
     /** True once this worker rebuilt its neighbour ring after the lottery completed. */
     private volatile boolean neighboursSyncedAfterLottery = false;
-
-    /** If the cluster never completes, elections fall back to the active set after this. */
-    private final long lotteryDeadline = System.currentTimeMillis() + LOTTERY_TIMEOUT_MS;
 
     private final ScheduledExecutorService lotteryScheduler;
 
@@ -439,7 +437,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void incrementJobAllocationCounter(Empty request, StreamObserver<IntValue> observer) {
-        respond(observer, IntValue.newBuilder().setValue(jobAllocationCounter.incrementAndGet()).build());
+        respond(observer, IntValue.newBuilder().setValue(recordJobAllocationInternal()).build());
     }
 
     @Override
@@ -455,7 +453,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void getJobsThisTerm(Empty request, StreamObserver<IntValue> observer) {
-        respond(observer, IntValue.newBuilder().setValue(jobsThisTerm.get()).build());
+        respond(observer, IntValue.newBuilder().setValue(completedJobsThisTerm.get()).build());
     }
 
     @Override
@@ -490,13 +488,13 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     @Override
     public void setCurrentCoordinatorId(IntValue request, StreamObserver<Empty> observer) {
-        recordCoordinator(request.getValue());
+        recordCoordinatorIfTermAllows(request.getValue(), "setCurrentCoordinatorId");
         respond(observer, EMPTY);
     }
 
     @Override
     public void getLeaderman(Empty request, StreamObserver<StringValue> observer) {
-        respond(observer, StringValue.newBuilder().setValue(LEADERMAN).build());
+        respond(observer, StringValue.newBuilder().setValue(leaderman).build());
     }
 
     @Override
@@ -548,7 +546,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void submitMaxJob(MaxJobRequest request, StreamObserver<TaskResult> observer) {
         try {
-            respond(observer, submitMaxJobInternal(request.getClientId(), request.getNumbers().getNumbersList()));
+            respondTask(observer, submitMaxJobInternal(request.getClientId(), request.getNumbers().getNumbersList()));
         } catch (StatusRuntimeException e) {
             observer.onError(e);
         } catch (RuntimeException e) {
@@ -570,7 +568,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void submitPrimeCount(PrimeCountRequest request, StreamObserver<TaskResult> observer) {
         try {
-            respond(observer, submitPrimeCountInternal(request.getClientId(), request.getNumbers().getNumbersList()));
+            respondTask(observer, submitPrimeCountInternal(request.getClientId(), request.getNumbers().getNumbersList()));
         } catch (StatusRuntimeException e) {
             observer.onError(e);
         } catch (RuntimeException e) {
@@ -592,7 +590,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     @Override
     public void submitPrimeSum(PrimeSumRequest request, StreamObserver<TaskResult> observer) {
         try {
-            respond(observer, submitPrimeSumInternal(request.getClientId(), request.getStart(), request.getEnd()));
+            respondTask(observer, submitPrimeSumInternal(request.getClientId(), request.getStart(), request.getEnd()));
         } catch (StatusRuntimeException e) {
             observer.onError(e);
         } catch (RuntimeException e) {
@@ -614,10 +612,14 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
     // ---------------------------------------------------------------- internal state
 
+    private void respondTask(StreamObserver<TaskResult> observer, TaskResult result) {
+        respond(observer, result);
+    }
+
     private int recordJobAllocationInternal() {
         int updated = jobAllocationCounter.incrementAndGet();
         System.out.println("[Worker " + workerId + "] JAC changed to " + updated
-                + " (processed a distributed job segment)");
+                + " (recorded a distributed job segment allocation)");
         return updated;
     }
 
@@ -646,17 +648,41 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     /**
-     * Atomically records the current coordinator. Whenever this node becomes the
-     * coordinator itself, a fresh term begins: the per-term submitted-job counter
-     * is reset to zero so the new coordinator gets a clean five-job budget.
+     * Atomically records the current coordinator. Whenever this node newly
+     * becomes the coordinator, a fresh term begins: the per-term accepted and
+     * completed submitted-job counters reset to zero. Repeated announcements for
+     * the same coordinator must not reset an in-progress term.
      */
     private void recordCoordinator(int coordinatorId) {
         int previous = currentCoordinatorId.getAndSet(coordinatorId);
-        if (coordinatorId == workerId) {
+        boolean startsNewLocalTerm = coordinatorId == workerId && previous != workerId;
+        if (startsNewLocalTerm) {
             jobsThisTerm.set(0);
+            completedJobsThisTerm.set(0);
+            termEndScheduled.set(false);
+        }
+        if (coordinatorId != WorkerClusterConfig.NO_COORDINATOR) {
+            electionVacancyAuthorized.set(false);
         }
         System.out.println("[Worker " + workerId + "] coordinator set to " + coordinatorId
                 + (previous == coordinatorId ? "" : " (was " + previous + ")"));
+        if (startsNewLocalTerm) {
+            System.out.println("[Worker " + workerId + "] ANNOUNCEMENT: I am the coordinator");
+        } else if (coordinatorId != WorkerClusterConfig.NO_COORDINATOR) {
+            System.out.println("[Worker " + workerId + "] ANNOUNCEMENT: coordinator is worker " + coordinatorId);
+        }
+    }
+
+    private boolean recordCoordinatorIfTermAllows(int coordinatorId, String source) {
+        int current = currentCoordinatorId.get();
+        if (current != WorkerClusterConfig.NO_COORDINATOR && current != coordinatorId) {
+            System.out.println("[Worker " + workerId + "] ignoring coordinator change from " + current
+                    + " to " + coordinatorId + " from " + source
+                    + " because the active coordinator term has not ended after 5 jobs");
+            return false;
+        }
+        recordCoordinator(coordinatorId);
+        return true;
     }
 
     private CandidateInfo selfCandidate() {
@@ -681,6 +707,17 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                 return "Coordinator already present: worker " + existing
                         + " - no election started (an election runs only when no coordinator "
                         + "is active, e.g. after a 5-job term ends)";
+            }
+            int liveCoordinator = discoverLiveCoordinator();
+            if (liveCoordinator != WorkerClusterConfig.NO_COORDINATOR) {
+                recordCoordinator(liveCoordinator);
+                return "Coordinator already present: worker " + liveCoordinator
+                        + " - no election started because a live coordinator was discovered";
+            }
+            if (!electionVacancyAuthorized.get()) {
+                return "Election not authorized - the active coordinator has not completed "
+                        + WorkerClusterConfig.COORDINATOR_TERM_LIMIT
+                        + " submitted jobs and has not failed";
             }
 
             refreshNeighboursInternal();
@@ -707,6 +744,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
 
             CandidateInfo winner = selectWinner(allParticipants.values());
             recordCoordinator(winner.getWorkerId());
+            processedCoordinatorAnnouncements.add(electionId);
 
             System.out.println("[Worker " + workerId + "] election " + electionId + " winner: worker "
                     + winner.getWorkerId() + " (JAC=" + winner.getJac() + ") across "
@@ -717,7 +755,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                     .setWinner(winner)
                     .addAllParticipants(allParticipants.values())
                     .build();
-            broadcastWinner(announcement);
+            propagateCoordinatorAnnouncement(announcement);
 
             return "Coordinator elected: worker " + winner.getWorkerId() + " (JAC=" + winner.getJac()
                     + ") across " + allParticipants.size() + " reachable workers [electionId=" + electionId + "]";
@@ -795,24 +833,43 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     private CandidateInfo selectWinner(Collection<CandidateInfo> candidates) {
-        return candidates.stream()
-                .min(Comparator.comparingInt(CandidateInfo::getJac)
-                        .thenComparing(Comparator.comparingInt(CandidateInfo::getPriorityId).reversed())
-                        .thenComparing(Comparator.comparingInt(CandidateInfo::getWorkerId).reversed()))
+        if (candidates == null || candidates.isEmpty()) {
+            throw internalError("election produced no candidates");
+        }
+        List<CandidateInfo> eligibleCandidates = new ArrayList<>(candidates);
+        int previousCoordinator = previousCoordinatorId.get();
+        if (previousCoordinator != WorkerClusterConfig.NO_COORDINATOR && eligibleCandidates.size() > 1) {
+            List<CandidateInfo> rotated = eligibleCandidates.stream()
+                    .filter(candidate -> candidate.getWorkerId() != previousCoordinator)
+                    .toList();
+            if (!rotated.isEmpty()) {
+                eligibleCandidates = rotated;
+            }
+        }
+
+        int lowestJac = eligibleCandidates.stream()
+                .mapToInt(CandidateInfo::getJac)
+                .min()
                 .orElseThrow(() -> internalError("election produced no candidates"));
+        List<CandidateInfo> eligible = eligibleCandidates.stream()
+                .filter(candidate -> candidate.getJac() == lowestJac)
+                .sorted(Comparator.comparingInt(CandidateInfo::getWorkerId))
+                .toList();
+        return eligible.get(0);
     }
 
-    private void broadcastWinner(WinnerAnnouncement announcement) {
-        for (CandidateInfo candidate : announcement.getParticipantsList()) {
-            if (candidate.getWorkerId() == workerId) {
+    private void propagateCoordinatorAnnouncement(WinnerAnnouncement announcement) {
+        for (WorkerInfo neighbour : neighbours) {
+            if (neighbour.getWorkerId() == workerId) {
                 continue;
             }
             try {
-                remoteClient(candidate).announceWinner(announcement);
-                System.out.println("[Worker " + workerId + "] winner announced to worker " + candidate.getWorkerId());
+                remoteClient(neighbour).announceWinner(announcement);
+                System.out.println("[Worker " + workerId + "] COORDINATOR message propagated to worker "
+                        + neighbour.getWorkerId());
             } catch (RuntimeException e) {
-                System.err.println("[Worker " + workerId + "] could not announce winner to worker "
-                        + candidate.getWorkerId() + ": " + e.getMessage());
+                System.err.println("[Worker " + workerId + "] could not propagate COORDINATOR message to worker "
+                        + neighbour.getWorkerId() + ": " + e.getMessage());
             }
         }
     }
@@ -821,16 +878,29 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
         if (announcement == null || !announcement.hasWinner()) {
             return;
         }
+        if (!processedCoordinatorAnnouncements.add(announcement.getElectionId())) {
+            System.out.println("[Worker " + workerId + "] dropping duplicate COORDINATOR message "
+                    + announcement.getElectionId());
+            return;
+        }
         processedElectionIds.add(announcement.getElectionId());
-        recordCoordinator(announcement.getWinner().getWorkerId());
+        int winnerId = announcement.getWinner().getWorkerId();
+        if (!recordCoordinatorIfTermAllows(winnerId, "COORDINATOR message " + announcement.getElectionId())) {
+            return;
+        }
         System.out.println("[Worker " + workerId + "] recorded coordinator worker "
-                + announcement.getWinner().getWorkerId() + " (JAC=" + announcement.getWinner().getJac()
+                + winnerId + " (JAC=" + announcement.getWinner().getJac()
                 + ") for election " + announcement.getElectionId());
+        propagateCoordinatorAnnouncement(announcement);
     }
 
     private void notifyTermEndInternal(int priorCoordinatorId, Map<Integer, Integer> finalJacTable) {
         System.out.println("[Worker " + workerId + "] received Term_End from coordinator worker "
                 + priorCoordinatorId + " -> final JAC table: " + finalJacTable);
+        previousCoordinatorId.set(priorCoordinatorId);
+        if (currentCoordinatorId.compareAndSet(priorCoordinatorId, WorkerClusterConfig.NO_COORDINATOR)) {
+            electionVacancyAuthorized.set(true);
+        }
     }
 
     // ---------------------------------------------------------------- neighbours
@@ -850,30 +920,13 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
             active.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
 
             neighbours.clear();
-
-            // Ring backbone: predecessor + successor guarantee reachability so the
-            // cluster can always reach agreement on a single coordinator.
-            int idx = 0;
-            for (int i = 0; i < active.size(); i++) {
-                if (active.get(i).getWorkerId() == workerId) {
-                    idx = i;
-                    break;
+            for (WorkerInfo peer : active) {
+                if (peer.getWorkerId() != workerId) {
+                    neighbours.add(peer);
                 }
             }
-            neighbours.add(active.get((idx - 1 + active.size()) % active.size()));
-            WorkerInfo successor = active.get((idx + 1) % active.size());
-            if (successor.getWorkerId() != workerId) {
-                neighbours.add(successor);
-            }
-
-            // Unstructured extra link: a random active worker keeps the network
-            // random and each worker holds only a subset of the other workers.
-            WorkerInfo randomPeer = bootstrap().getRandomWorker(EMPTY);
-            if (randomPeer.getWorkerId() > 0 && randomPeer.getWorkerId() != workerId
-                    && neighbours.add(randomPeer)) {
-                System.out.println("[Worker " + workerId + "] random link added -> "
-                        + randomPeer.getWorkerId() + " (neighbours=" + neighbours.size() + ")");
-            }
+            System.out.println("[Worker " + workerId + "] connected to all other worker nodes "
+                    + "(neighbours=" + neighbours.size() + "): " + neighbours);
 
             return neighbours.size();
         } catch (RuntimeException e) {
@@ -899,8 +952,6 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     private static final long LOTTERY_MIN_DELAY_MS = 150;
     private static final int LOTTERY_SPAN_MS = 150;
     private static final long LOTTERY_POLL_MS = 200;
-    private static final long LOTTERY_TIMEOUT_MS = 20_000;
-
     private static final int SEGMENT_NUMBERS = 3;
     private static final int SEGMENT_RANGE_LENGTH = 200;
 
@@ -912,23 +963,17 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     private void lotteryTick() {
-        if (declaredInitial) {
-            return;
-        }
         try {
             if (priorityId == 0) {
                 if (lotteryFireAt == -1L) {
                     long completeTime = readClusterCompleteTime();
-                    boolean fullCluster = readActiveWorkerCount() >= WorkerClusterConfig.WORKER_COUNT;
+                    int expectedClusterSize = readClusterSize();
+                    boolean fullCluster = readActiveWorkerCount() >= expectedClusterSize;
                     if (completeTime > 0 && fullCluster) {
                         lotteryFireAt = completeTime + lotteryCountdown();
                         System.out.println("[Worker " + workerId + "] lottery countdown -> "
                                 + (lotteryFireAt - System.currentTimeMillis())
                                 + " ms (cluster complete at " + completeTime + ")");
-                    } else if (System.currentTimeMillis() > lotteryDeadline) {
-                        lotteryFireAt = System.currentTimeMillis() + lotteryCountdown();
-                        System.out.println("[Worker " + workerId + "] cluster not complete within "
-                                + LOTTERY_TIMEOUT_MS + " ms - starting a partial startup lottery");
                     } else {
                         return;
                     }
@@ -940,8 +985,8 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                         .getValue();
                 priorityId = assigned;
                 System.out.println("[Worker " + workerId + "] lottery claim -> startup priority "
-                        + assigned + " (all JACs are 0, so priority "
-                        + WorkerClusterConfig.WORKER_COUNT + " starts as Initial Coordinator)");
+                        + assigned + " (Bootstrap only sequences startup claims; "
+                        + "workers still elect the coordinator)");
             }
 
             if (priorityId != 0 && isPriorityTableComplete() && !neighboursSyncedAfterLottery) {
@@ -951,26 +996,6 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                         + "(neighbours=" + neighbours.size() + ")");
             }
 
-            if (priorityId == WorkerClusterConfig.WORKER_COUNT
-                    && isPriorityTableComplete()
-                    && currentCoordinatorId.get() == WorkerClusterConfig.NO_COORDINATOR) {
-                declaredInitial = true;
-                recordCoordinator(workerId);
-                System.out.println("[Worker " + workerId + "] priority " + WorkerClusterConfig.WORKER_COUNT
-                        + " -> declaring self Initial Coordinator and alerting the other "
-                        + (WorkerClusterConfig.WORKER_COUNT - 1) + " workers");
-                for (WorkerInfo other : bootstrap().getActiveWorkers(EMPTY).getWorkersList()) {
-                    if (other.getWorkerId() == workerId) {
-                        continue;
-                    }
-                    try {
-                        remoteClient(other).setCurrentCoordinatorId(workerId);
-                    } catch (RuntimeException e) {
-                        System.err.println("[Worker " + workerId + "] could not alert worker "
-                                + other.getWorkerId() + ": " + e.getMessage());
-                    }
-                }
-            }
         } catch (RuntimeException e) {
             System.err.println("[Worker " + workerId + "] lottery check failed: " + e.getMessage());
         }
@@ -996,32 +1021,186 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
         }
     }
 
+    private int readClusterSize() {
+        try {
+            return bootstrap().getClusterSize(EMPTY).getValue();
+        } catch (RuntimeException e) {
+            return WorkerClusterConfig.WORKER_COUNT;
+        }
+    }
+
     private boolean isPriorityTableComplete() {
         try {
-            return bootstrap().getPriorityTable(EMPTY).getPrioritiesCount() >= WorkerClusterConfig.WORKER_COUNT;
+            return bootstrap().getPriorityTable(EMPTY).getPrioritiesCount() >= readClusterSize();
         } catch (RuntimeException e) {
             return false;
         }
     }
 
     private void autoElectionTick() {
+        int knownCoordinator = currentCoordinatorId.get();
+        if (knownCoordinator != WorkerClusterConfig.NO_COORDINATOR && !isCoordinatorAlive(knownCoordinator)) {
+            if (currentCoordinatorId.compareAndSet(knownCoordinator, WorkerClusterConfig.NO_COORDINATOR)) {
+                previousCoordinatorId.set(knownCoordinator);
+                electionVacancyAuthorized.set(true);
+                System.out.println("[Worker " + workerId + "] coordinator worker " + knownCoordinator
+                        + " is no longer active - triggering re-election");
+            }
+        }
         if (currentCoordinatorId.get() != WorkerClusterConfig.NO_COORDINATOR || electionInProgress.get()) {
             return;
         }
-        if (priorityId <= 0) {
+        if (readActiveWorkerCount() == 0) {
             return;
         }
-        if (System.currentTimeMillis() < lotteryDeadline && !isPriorityTableComplete()) {
+        if (workerId != highestActiveWorkerId()) {
             return;
         }
         try {
             String result = initiateElectionInternal();
-            if (!result.startsWith("Coordinator already present")) {
+            if (!result.startsWith("Coordinator already present")
+                    && !result.startsWith("Election not authorized")) {
                 System.out.println("[Worker " + workerId + "] auto-election result: " + result);
             }
         } catch (RuntimeException e) {
             System.err.println("[Worker " + workerId + "] auto-election failed: " + e.getMessage());
         }
+    }
+
+    private int highestActiveWorkerId() {
+        try {
+            int highest = workerId;
+            for (WorkerInfo worker : bootstrap().getActiveWorkers(EMPTY).getWorkersList()) {
+                highest = Math.max(highest, worker.getWorkerId());
+            }
+            return highest;
+        } catch (RuntimeException e) {
+            return workerId;
+        }
+    }
+
+    private boolean isWorkerActive(int targetWorkerId) {
+        if (targetWorkerId == workerId) {
+            return true;
+        }
+        try {
+            for (WorkerInfo worker : bootstrap().getActiveWorkers(EMPTY).getWorkersList()) {
+                if (worker.getWorkerId() == targetWorkerId) {
+                    return true;
+                }
+            }
+        } catch (RuntimeException e) {
+            return false;
+        }
+        return false;
+    }
+
+    private boolean isCoordinatorAlive(int coordinatorId) {
+        if (coordinatorId == workerId) {
+            return true;
+        }
+        WorkerInfo coordinatorInfo = findWorkerInfo(coordinatorId);
+        if (coordinatorInfo == null) {
+            return false;
+        }
+        try {
+            int reported = workerProbe(coordinatorInfo)
+                    .withDeadlineAfter(1, TimeUnit.SECONDS)
+                    .getCurrentCoordinatorId(EMPTY)
+                    .getValue();
+            return reported == coordinatorId;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private int discoverLiveCoordinator() {
+        int discovered = discoverLiveCoordinatorFrom(neighbourListInternal());
+        if (discovered != WorkerClusterConfig.NO_COORDINATOR) {
+            return discovered;
+        }
+        try {
+            return discoverLiveCoordinatorFrom(bootstrap().getActiveWorkers(EMPTY).getWorkersList());
+        } catch (RuntimeException e) {
+            return WorkerClusterConfig.NO_COORDINATOR;
+        }
+    }
+
+    private int discoverLiveCoordinatorFrom(List<WorkerInfo> workers) {
+        if (workers == null) {
+            return WorkerClusterConfig.NO_COORDINATOR;
+        }
+        for (WorkerInfo worker : workers) {
+            int candidateId = worker.getWorkerId();
+            if (candidateId == workerId) {
+                continue;
+            }
+            try {
+                int reportedCoordinator = workerProbe(worker)
+                        .withDeadlineAfter(1, TimeUnit.SECONDS)
+                        .getCurrentCoordinatorId(EMPTY)
+                        .getValue();
+                if (reportedCoordinator != WorkerClusterConfig.NO_COORDINATOR
+                        && isCoordinatorKnownReachable(reportedCoordinator, workers)) {
+                    return reportedCoordinator;
+                }
+            } catch (RuntimeException ignored) {
+                // Ignore a stale worker and keep looking for an active coordinator.
+            }
+        }
+        return WorkerClusterConfig.NO_COORDINATOR;
+    }
+
+    private boolean isCoordinatorKnownReachable(int coordinatorId, List<WorkerInfo> knownWorkers) {
+        if (coordinatorId == workerId) {
+            return true;
+        }
+        WorkerInfo coordinatorInfo = null;
+        if (knownWorkers != null) {
+            for (WorkerInfo worker : knownWorkers) {
+                if (worker.getWorkerId() == coordinatorId) {
+                    coordinatorInfo = worker;
+                    break;
+                }
+            }
+        }
+        if (coordinatorInfo == null) {
+            coordinatorInfo = findWorkerInfo(coordinatorId);
+        }
+        if (coordinatorInfo == null) {
+            return false;
+        }
+        try {
+            int reported = workerProbe(coordinatorInfo)
+                    .withDeadlineAfter(1, TimeUnit.SECONDS)
+                    .getCurrentCoordinatorId(EMPTY)
+                    .getValue();
+            return reported == coordinatorId;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private WorkerInfo findWorkerInfo(int targetWorkerId) {
+        for (WorkerInfo worker : neighbours) {
+            if (worker.getWorkerId() == targetWorkerId) {
+                return worker;
+            }
+        }
+        try {
+            for (WorkerInfo worker : bootstrap().getActiveWorkers(EMPTY).getWorkersList()) {
+                if (worker.getWorkerId() == targetWorkerId) {
+                    return worker;
+                }
+            }
+        } catch (RuntimeException ignored) {
+            // Caller will treat this as not found.
+        }
+        return null;
+    }
+
+    private WorkerServiceGrpc.WorkerServiceBlockingStub workerProbe(WorkerInfo worker) {
+        return WorkerServiceGrpc.newBlockingStub(channelPool.channel(worker.getHost(), worker.getPort()));
     }
 
     // ---------------------------------------------------------------- jobs
@@ -1038,21 +1217,37 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     private <T> T runJob(int termSlot, Callable<T> job) {
-        System.out.println("[Worker " + workerId + "] submitted job #" + termSlot + " -> queued on executor");
+        System.out.println("[Worker " + workerId + "] accepted submitted job #" + termSlot
+                + "/" + WorkerClusterConfig.COORDINATOR_TERM_LIMIT + " for this coordinator term");
         try {
-            return jobExecutor.submit(() -> {
+            T result = jobExecutor.submit(() -> {
                 System.out.println("[Worker " + workerId + "] executing submitted job #" + termSlot
                         + " on thread " + Thread.currentThread().getName());
                 return job.call();
             }).get();
+            markCompletedJob(termSlot);
+            return result;
         } catch (ExecutionException e) {
+            releaseTermSlot(termSlot);
             throw unwrapExecution(e);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+            releaseTermSlot(termSlot);
             throw internalError("Job interrupted");
-        } finally {
-            maybeEndCoordinatorTerm();
         }
+    }
+
+    private void markCompletedJob(int termSlot) {
+        int completed = completedJobsThisTerm.incrementAndGet();
+        System.out.println("[Worker " + workerId + "] completed submitted job #" + completed
+                + "/" + WorkerClusterConfig.COORDINATOR_TERM_LIMIT
+                + " for this coordinator term (accepted slot " + termSlot + ")");
+    }
+
+    private void releaseTermSlot(int termSlot) {
+        jobsThisTerm.updateAndGet(current -> Math.max(0, current - 1));
+        System.out.println("[Worker " + workerId + "] submitted job slot " + termSlot
+                + " did not complete successfully - it does not count toward the 5 completed jobs");
     }
 
     private StatusRuntimeException unwrapExecution(ExecutionException e) {
@@ -1079,6 +1274,9 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
         for (; ; ) {
             int current = jobsThisTerm.get();
             if (current >= WorkerClusterConfig.COORDINATOR_TERM_LIMIT) {
+                if (hasCompletedFiveJobs() && termEndScheduled.compareAndSet(false, true)) {
+                    endCoordinatorTerm();
+                }
                 throw failedPrecondition("Coordinator term ended after "
                         + WorkerClusterConfig.COORDINATOR_TERM_LIMIT + " jobs; no jobs can be processed "
                         + "until the next leader election completes");
@@ -1089,40 +1287,21 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
         }
     }
 
-    /**
-     * Ends the coordinator's term as soon as the last accepted job completes:
-     * the coordinator demotes itself and immediately starts a new distributed
-     * leader election.
-     */
-    private void maybeEndCoordinatorTerm() {
-        if (jobsThisTerm.get() < WorkerClusterConfig.COORDINATOR_TERM_LIMIT) {
+    private void endCoordinatorTerm() {
+        if (!hasCompletedFiveJobs()) {
+            termEndScheduled.set(false);
             return;
         }
         if (!currentCoordinatorId.compareAndSet(workerId, WorkerClusterConfig.NO_COORDINATOR)) {
             return;
         }
+        previousCoordinatorId.set(workerId);
+        electionVacancyAuthorized.set(true);
         System.out.println("[Worker " + workerId + "] completed "
                 + WorkerClusterConfig.COORDINATOR_TERM_LIMIT + " jobs this term - ending term "
                 + "and starting a new leader election");
-        Map<Integer, Integer> jacTable = broadcastTermEnd();
-
-        // Demotion tick: the coordinator never executes segments itself (every
-        // segment goes to the worker nodes), so its own JAC stays flat while the
-        // worker nodes climb. Lifting the outgoing coordinator's JAC strictly
-        // above the highest worker-node JAC forces the next election to rotate.
-        int highestNodeJac = Integer.MIN_VALUE;
-        for (Map.Entry<Integer, Integer> entry : jacTable.entrySet()) {
-            if (entry.getKey() != workerId) {
-                highestNodeJac = Math.max(highestNodeJac, entry.getValue());
-            }
-        }
-        if (highestNodeJac != Integer.MIN_VALUE) {
-            int demotionTarget = highestNodeJac + 1;
-            if (jobAllocationCounter.get() <= highestNodeJac) {
-                jobAllocationCounter.addAndGet(demotionTarget - jobAllocationCounter.get());
-            }
-        }
-        System.out.println("[Worker " + workerId + "] demotion tick -> JAC is now "
+        broadcastTermEnd();
+        System.out.println("[Worker " + workerId + "] term ended with JAC="
                 + jobAllocationCounter.get());
 
         try {
@@ -1133,10 +1312,13 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
         }
     }
 
+    private boolean hasCompletedFiveJobs() {
+        return completedJobsThisTerm.get() == WorkerClusterConfig.COORDINATOR_TERM_LIMIT;
+    }
+
     /**
      * Phase-3 step-down protocol: the coordinator broadcasts a Term_End message
-     * with the final verified JAC table to every reachable worker. Returns that
-     * JAC table so the caller can compute its own step-down penalty.
+     * with the final verified JAC table to every reachable worker.
      */
     private Map<Integer, Integer> broadcastTermEnd() {
         List<WorkerClient> reachable = getReachableWorkerServices();
@@ -1184,9 +1366,8 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
             int targetId = readWorkerId(worker);
             usedWorkers.add(targetId);
 
-            worker.recordAllocation();
-
             try {
+                worker.recordAllocation();
                 System.out.println("[Worker " + workerId + "] MAX task " + taskId + " segment "
                         + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
                         + ", section=" + chunk);
@@ -1276,9 +1457,8 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
             int targetId = readWorkerId(worker);
             usedWorkers.add(targetId);
 
-            worker.recordAllocation();
-
             try {
+                worker.recordAllocation();
                 System.out.println("[Worker " + workerId + "] PRIMECOUNT task " + taskId + " segment "
                         + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
                         + ", section=" + chunk);
@@ -1366,9 +1546,8 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
             int targetId = readWorkerId(worker);
             usedWorkers.add(targetId);
 
-            worker.recordAllocation();
-
             try {
+                worker.recordAllocation();
                 System.out.println("[Worker " + workerId + "] PRIMESUM task " + taskId + " segment "
                         + (index + 1) + "/" + segmentCount + " -> toWorkerId=" + targetId
                         + ", range=[" + segmentStart + ", " + segmentEnd + "]");
@@ -1492,32 +1671,24 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                 jacByWorker.put(reachableWorkerId, readJAC(client));
             }
         }
-        // Phase 2 targeting: least-loaded workers first (ascending JAC, then
-        // descending startup priority, then ascending worker id).
+        // Phase 2 targeting: lowest-JAC workers first; ties prefer the higher id.
         clients.sort(Comparator
                 .comparingInt((WorkerClient worker) -> jacByWorker.getOrDefault(readWorkerId(worker), Integer.MAX_VALUE))
-                .thenComparing(Comparator.comparingInt((WorkerClient worker) -> readPriority(worker)).reversed())
-                .thenComparingInt(this::readWorkerId));
+                .thenComparing(Comparator.comparingInt((WorkerClient worker) -> readWorkerId(worker)).reversed()));
         return clients;
     }
 
     /**
      * The workers a coordinator may hand segments of a client task to: every
-     * reachable active worker EXCEPT the coordinator itself. The coordinator
-     * only assigns and compiles - it never executes a segment itself.
+     * reachable active worker, including the coordinator itself. This keeps work
+     * shared across all active worker nodes when the input is large enough.
      */
     private List<WorkerClient> getAssignmentWorkers() {
-        List<WorkerClient> others = new ArrayList<>();
-        for (WorkerClient worker : getReachableWorkerServices()) {
-            if (readWorkerId(worker) != workerId) {
-                others.add(worker);
-            }
+        List<WorkerClient> workers = getReachableWorkerServices();
+        if (workers.isEmpty()) {
+            throw failedPrecondition("No worker nodes reachable for task distribution");
         }
-        if (others.isEmpty()) {
-            throw failedPrecondition("No worker nodes reachable for task distribution - "
-                    + "the coordinator worker " + workerId + " is the only reachable node");
-        }
-        return others;
+        return workers;
     }
 
     private WorkerClient lookupReachableWorker(Map<Integer, WorkerInfo> activeWorkers, int targetWorkerId) {
@@ -1532,14 +1703,14 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     /**
-     * Phase-2 variable segmentation: a task is split into {@code ceil(items /
-     * perSegment)} contiguous segments, capped at the number of active workers.
+     * Phase-2 distribution: spread the task across as many reachable worker
+     * nodes as the input allows, capped by the active reachable worker count.
      */
     private static int segmentCountFor(int activeWorkers, int totalItems, int perSegment) {
         if (totalItems <= 0) {
             return 0;
         }
-        return Math.max(1, Math.min(activeWorkers, (totalItems + perSegment - 1) / perSegment));
+        return Math.max(1, Math.min(activeWorkers, totalItems));
     }
 
     // ---------------------------------------------------------------- local accessors
@@ -1558,7 +1729,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
     }
 
     String leadermanName() {
-        return LEADERMAN;
+        return leaderman;
     }
 
     /** Releases the executors and gRPC channels held by this worker. */
@@ -1577,7 +1748,7 @@ public class WorkerServiceImpl extends WorkerServiceGrpc.WorkerServiceImplBase {
                 + ", jobAllocationCounter=" + jobAllocationCounter.get()
                 + ", neighbours=" + neighbours
                 + ", currentCoordinatorId=" + currentCoordinatorId.get()
-                + ", leaderman='" + LEADERMAN + '\''
+                + ", leaderman='" + leaderman + '\''
                 + '}';
     }
 }

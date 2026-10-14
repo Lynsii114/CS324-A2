@@ -40,10 +40,10 @@ public final class UITheme {
     public static final Color BORDER = new Color(0xC4, 0xCC, 0xD8);
     public static final Color LIGHT = new Color(0xFF, 0xFF, 0xFF);
 
-    public static final Font BASE = new Font("SansSerif", Font.PLAIN, 15);
-    public static final Font MEDIUM = new Font("SansSerif", Font.PLAIN, 17);
-    public static final Font BOLD = new Font("SansSerif", Font.BOLD, 15);
-    public static final Font SECTION = new Font("SansSerif", Font.BOLD, 17);
+    public static final Font BASE = new Font("SansSerif", Font.PLAIN, 13);
+    public static final Font MEDIUM = new Font("SansSerif", Font.PLAIN, 14);
+    public static final Font BOLD = new Font("SansSerif", Font.BOLD, 13);
+    public static final Font SECTION = new Font("SansSerif", Font.BOLD, 15);
     public static final Font TITLE = new Font("SansSerif", Font.BOLD, 21);
     public static final Font BIG = new Font("SansSerif", Font.BOLD, 28);
     public static final Font MONO = new Font(Font.MONOSPACED, Font.PLAIN, 14);
@@ -103,7 +103,7 @@ public final class UITheme {
         button.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
         button.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(BORDER),
-                BorderFactory.createEmptyBorder(9, 16, 9, 16)));
+                BorderFactory.createEmptyBorder(6, 10, 6, 10)));
     }
 
     public static void textField(JTextField field) {
@@ -113,7 +113,7 @@ public final class UITheme {
         field.setFont(MEDIUM);
         field.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(BORDER),
-                BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+                BorderFactory.createEmptyBorder(4, 6, 4, 6)));
     }
 
     public static void textArea(JTextArea area) {
@@ -123,7 +123,7 @@ public final class UITheme {
         area.setFont(MEDIUM);
         area.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(BORDER),
-                BorderFactory.createEmptyBorder(6, 8, 6, 8)));
+                BorderFactory.createEmptyBorder(4, 6, 4, 6)));
     }
 
     public static void combo(JComboBox<?> combo) {
@@ -136,7 +136,7 @@ public final class UITheme {
                                                           boolean isSelected, boolean cellHasFocus) {
                 super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
                 setFont(MEDIUM);
-                setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
+                setBorder(BorderFactory.createEmptyBorder(4, 8, 4, 8));
                 setBackground(isSelected ? BUTTON : INPUT);
                 setForeground(isSelected ? LIGHT : TEXT);
                 return this;
