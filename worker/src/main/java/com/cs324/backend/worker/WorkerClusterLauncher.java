@@ -110,7 +110,7 @@ public final class WorkerClusterLauncher {
                     javaBin,
                     "-D" + WorkerClusterConfig.WORKER_COUNT_PROPERTY + "=" + WorkerClusterConfig.WORKER_COUNT,
                     "-cp", classpath,
-                    WorkerServer.class.getName(),
+                    WorkerNode.class.getName(),
                     String.valueOf(workerId),
                     String.valueOf(port),
                     bootstrapHost,
@@ -280,17 +280,17 @@ public final class WorkerClusterLauncher {
     }
 
     /**
-     * Finds every live JVM running our WorkerServer command line for <i>workerId</i>
+     * Finds every live JVM running our WorkerNode command line for <i>workerId</i>
      * on <i>port</i>, regardless of whether a pid file tracks it.
      */
     private static List<Long> findRunningPids(int workerId, int port) {
         Pattern pattern = Pattern.compile(
-                "com\\.cs324\\.backend\\.worker\\.WorkerServer\\s+" + workerId + "\\s+" + port + "(?:\\s|$)");
+                "com\\.cs324\\.backend\\.worker\\.WorkerNode\\s+" + workerId + "\\s+" + port + "(?:\\s|$)");
         List<Long> pids = new ArrayList<>();
         try {
             ProcessHandle.allProcesses().forEach(handle -> {
                 String commandLine = handle.info().commandLine().orElse("");
-                if (commandLine.contains(WorkerServer.class.getName())
+                if (commandLine.contains(WorkerNode.class.getName())
                         && pattern.matcher(commandLine).find()) {
                     pids.add(handle.pid());
                 }

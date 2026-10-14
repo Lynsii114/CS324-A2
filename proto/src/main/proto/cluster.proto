@@ -45,6 +45,36 @@ message WorkerList {
   repeated WorkerInfo workers = 1;
 }
 
+message WorkerHeartbeat {
+  int32 workerId = 1;
+}
+
+message WorkerStatus {
+  int32 workerId = 1;
+  string host = 2;
+  int32 port = 3;
+  string status = 4;
+  int64 lastHeartbeatMillis = 5;
+  bool coordinator = 6;
+}
+
+message ClusterStatus {
+  repeated WorkerStatus workers = 1;
+  int32 coordinatorId = 2;
+}
+
+// A GUI client that has connected through the Bootstrap Node.
+message ClientInfo {
+  string clientId = 1;
+  string name = 2;
+  string host = 3;
+  int64 connectedAtMillis = 4;
+}
+
+message ClientList {
+  repeated ClientInfo clients = 1;
+}
+
 // workerId -> startup priority id minted by the startup lottery.
 message PriorityTable {
   map<int32, int32> priorities = 1;
@@ -139,13 +169,19 @@ message TermEndRequest {
 service BootstrapService {
   rpc registerWorker(WorkerInfo) returns (Empty);
   rpc unregisterWorker(WorkerId) returns (Empty);
+  rpc workerHeartbeat(WorkerHeartbeat) returns (Empty);
   rpc getActiveWorkers(Empty) returns (WorkerList);
+  rpc getClusterStatus(Empty) returns (ClusterStatus);
   rpc getRandomWorker(Empty) returns (WorkerInfo);
   rpc lotteryClaim(WorkerId) returns (IntValue);
   rpc getWorkerPriority(WorkerId) returns (IntValue);
   rpc getPriorityTable(Empty) returns (PriorityTable);
   rpc getClusterCompleteTime(Empty) returns (LongValue);
   rpc getClusterSize(Empty) returns (IntValue);
+  rpc setClusterSize(IntValue) returns (IntValue);
+  rpc registerClient(ClientInfo) returns (Empty);
+  rpc unregisterClient(StringValue) returns (Empty);
+  rpc getActiveClients(Empty) returns (ClientList);
 }
 
 // Worker node: state, neighbour management, distributed leader election and

@@ -63,7 +63,7 @@ and consumed by every other module as a normal Maven dependency.
 | Module | What it contains | Artifact |
 |--------|------------------|----------|
 | `proto` | The `.proto` blueprint, generated gRPC stubs, and the shared config/helpers in `com.cs324.common` (`WorkerClusterConfig`, `GrpcSupport`, `ChannelPool`). | `proto/target/proto-1.0-SNAPSHOT.jar` |
-| `worker` | A worker node: `WorkerServiceImpl` (election + task execution), `WorkerServer` (entry point), `WorkerClusterLauncher` (spawns N workers as JVMs). | `worker/target/worker.jar` (fat jar) |
+| `worker` | A worker node: `WorkerNode` (process entry point), `WorkerServiceImpl` (election + task execution), `WorkerClusterLauncher` (spawns N workers as JVMs). | `worker/target/worker.jar` (fat jar) |
 | `bootstrap` | The Bootstrap Node: `BootstrapServiceImpl` (membership), `BootstrapServer` (starts the gRPC server and launches all workers). | `bootstrap/target/bootstrap.jar` (fat jar) |
 | `client` | The client GUI (`ClientGUI`) plus its Swing theme (`UITheme`). | `client/target/client.jar` (fat jar) |
 
@@ -142,6 +142,59 @@ executable fat jars:
 - `client/target/client.jar`
 
 All launch commands below use `java -jar <module>/target/<name>.jar`.
+
+---
+
+## Dynamic Startup in Separate VS Code Terminals
+
+Start each process in its own VS Code terminal. Bootstrap starts first and only maintains membership;
+the Client GUI does not start or stop worker processes.
+
+**Terminal 1 - Bootstrap Node**
+
+```powershell
+java -jar bootstrap/target/bootstrap.jar
+```
+
+**Terminal 2 - Worker Node 1**
+
+```powershell
+java -jar worker/target/worker.jar 1 5001
+```
+
+**Terminal 3 - Worker Node 2**
+
+```powershell
+java -jar worker/target/worker.jar 2 5002
+```
+
+**Terminal 4 - More Worker Nodes**
+
+```powershell
+# worker N uses port 5000 + N
+java -jar worker/target/worker.jar 3 5003
+java -jar worker/target/worker.jar 4 5004
+```
+
+You can also let the worker choose the next free ID and port:
+
+```powershell
+java -jar worker/target/worker.jar
+.\worker.ps1
+Worker.cmd
+```
+
+**Terminal 5 - Client GUI**
+
+```powershell
+java -jar client/target/client.jar
+```
+
+Click **Connect** in the GUI. The GUI polls Bootstrap over gRPC for live cluster status: active
+worker count, worker IDs, RUNNING status, and current coordinator. Start another worker at any time
+to join dynamically. Stop a worker with **Ctrl+C**; Bootstrap unregisters it or removes it after a
+heartbeat timeout, and the GUI refreshes automatically. If the stopped worker was coordinator, the
+remaining workers trigger a new election.
 
 ---
 
@@ -224,7 +277,23 @@ java -jar bootstrap/target/bootstrap.jar 2099
 
 ### Step 2 — Start the workers (one JVM each)
 
-Run `WorkerServer` manually (IDs `1..N`, gRPC ports `5001..5000+N`):
+Run `WorkerNode` manually. If Bootstrap has a confirmed worker count, you can start one
+separate worker JVM at a time and let it pick the next available ID (`1..N`, max `10`):
+
+```bash
+java -jar worker/target/worker.jar
+java -jar worker/target/worker.jar
+java -jar worker/target/worker.jar
+```
+
+On Windows, the helper does the same thing:
+
+```powershell
+.\worker.ps1
+Worker.cmd
+```
+
+You can still pass IDs explicitly when needed (worker *N* uses gRPC port `5000+N`):
 
 ```bash
 java -jar worker/target/worker.jar 1 5001
@@ -241,7 +310,8 @@ java -jar worker/target/worker.jar 8 5008
 Optional trailing arguments (only needed when something is not on `localhost`):
 
 ```text
-WorkerServer <workerId> <port> [bootstrapHost] [bootstrapPort] [workerHost]
+WorkerNode [auto] [bootstrapHost] [bootstrapPort] [workerHost]
+WorkerNode <workerId> <port> [bootstrapHost] [bootstrapPort] [workerHost]
 ```
 
 ### Step 3 — Wait for the automatic election
@@ -258,7 +328,7 @@ java -jar client/target/client.jar
 
 ### Launcher convenience commands (bash, not a GUI)
 
-The launcher lives in the `worker` module; its jar's main class is `WorkerServer`, so invoke the
+The launcher lives in the `worker` module; its jar's main class is `WorkerNode`, so invoke the
 launcher class explicitly:
 
 ```bash

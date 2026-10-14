@@ -2,11 +2,9 @@ package com.cs324.common;
 
 /**
  * Central configuration shared by the Bootstrap Node, the worker nodes and the
- * client. The cluster size is configurable: by default six worker nodes (IDs
- * 1..6), and extra nodes can be added on top by setting the
- * {@code cs324.worker.count} system property - the minimum is 6, so a smaller
- * value is ignored. Each worker owns its own gRPC port (5001 + id - 1), so
- * every worker runs in an isolated environment.
+ * client. The cluster size starts at 0 until the user confirms a worker count.
+ * Confirmed clusters must contain 1..10 worker nodes. Each worker owns its own
+ * gRPC port (5001 + id - 1), so every worker runs in an isolated environment.
  */
 public final class WorkerClusterConfig {
 
@@ -14,10 +12,13 @@ public final class WorkerClusterConfig {
     public static final String WORKER_COUNT_PROPERTY = "cs324.worker.count";
 
     /** The smallest cluster that can be started. */
-    public static final int MIN_WORKER_COUNT = 6;
+    public static final int MIN_WORKER_COUNT = 1;
 
-    /** Cluster size used when {@code cs324.worker.count} is not set on the command line. */
-    public static final int DEFAULT_WORKER_COUNT = 6;
+    /** The largest cluster supported by the manual launcher and GUI. */
+    public static final int MAX_WORKER_COUNT = 10;
+
+    /** Cluster size used before the user confirms a worker count. */
+    public static final int DEFAULT_WORKER_COUNT = 0;
 
     /** Number of worker nodes in the cluster (never below {@link #MIN_WORKER_COUNT}). */
     public static final int WORKER_COUNT = resolveWorkerCount();
@@ -45,17 +46,22 @@ public final class WorkerClusterConfig {
     private WorkerClusterConfig() {
     }
 
-    /** Reads {@code cs324.worker.count} (clamped to the 6-node minimum) at class load. */
+    /** Reads {@code cs324.worker.count} (clamped to the supported range) at class load. */
     public static int resolveWorkerCount() {
         String raw = System.getProperty(WORKER_COUNT_PROPERTY);
         if (raw == null) {
             return DEFAULT_WORKER_COUNT;
         }
         try {
-            return Math.max(MIN_WORKER_COUNT, Integer.parseInt(raw.trim()));
+            return clampWorkerCount(Integer.parseInt(raw.trim()));
         } catch (NumberFormatException e) {
             return DEFAULT_WORKER_COUNT;
         }
+    }
+
+    /** Keeps a requested worker count inside the supported range. */
+    public static int clampWorkerCount(int requested) {
+        return Math.max(MIN_WORKER_COUNT, Math.min(MAX_WORKER_COUNT, requested));
     }
 
     /** Returns the configured worker IDs: 1, 2, ..., WORKER_COUNT. */
