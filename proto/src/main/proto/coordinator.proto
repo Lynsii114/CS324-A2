@@ -14,7 +14,7 @@ service CoordinatorService {
 
 message RegisterRequest { string worker_ip = 1; int32 worker_port = 2; repeated string capabilities = 3; }
 message RegisterResponse { string worker_id = 1; bool status = 2; string error_message = 3; }
-message ProgressReport { string worker_id = 1; string task_id = 2; int32 segment_id = 3; float completion_percentage = 4; int64 rows_processed = 5; string status_message = 6; }
+message ProgressReport { string worker_id = 1; string task_id = 2; int32 segment_id = 3; float completion_percentage = 4; int64 rows_processed = 5; string status_message = 6; int32 total_segments = 7; }
 message ProgressSummary { bool acknowledged = 1; }
 message RecoveryRequest { string coordinator_id = 1; int64 last_known_sequence = 2; }
 message SnapshotState { int64 snapshot_timestamp = 1; repeated WorkerMetadata active_workers = 2; repeated TaskAssignment ongoing_assignments = 3; repeated TaskResult completed_results = 4; }

@@ -15,6 +15,7 @@ import io.grpc.stub.StreamObserver;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -26,6 +27,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.CoordinatorServiceImplBase {
     private final ConcurrentMap<String, WorkerMetadata> workers = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ProgressReport> progressBySegment = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Integer> expectedSegmentsByTask = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, Long> taskStartedAt = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, TaskResult> completedResults = new ConcurrentHashMap<>();
     private final AtomicLong progressSequence = new AtomicLong();
 
@@ -65,15 +68,35 @@ public final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.Coordin
                 if (failed) return;
                 if (report.getWorkerId().isBlank() || report.getTaskId().isBlank()
                         || report.getSegmentId() < 0
+                        || report.getTotalSegments() <= 0
+                        || report.getSegmentId() >= report.getTotalSegments()
                         || !Float.isFinite(report.getCompletionPercentage())
                         || report.getCompletionPercentage() < 0.0f
                         || report.getCompletionPercentage() > 100.0f) {
                     failed = true;
                     responseObserver.onError(Status.INVALID_ARGUMENT
-                            .withDescription("progress requires worker/task IDs, a nonnegative segment, and completion in [0,100]")
+                            .withDescription("progress requires worker/task IDs, a valid segment/total_segments pair, and completion in [0,100]")
                             .asRuntimeException());
                     return;
                 }
+                if (!workers.containsKey(report.getWorkerId())) {
+                    failed = true;
+                    responseObserver.onError(Status.NOT_FOUND
+                            .withDescription("worker " + report.getWorkerId() + " is not registered")
+                            .asRuntimeException());
+                    return;
+                }
+
+                Integer expectedSegments = expectedSegmentsByTask.putIfAbsent(
+                        report.getTaskId(), report.getTotalSegments());
+                if (expectedSegments != null && expectedSegments != report.getTotalSegments()) {
+                    failed = true;
+                    responseObserver.onError(Status.INVALID_ARGUMENT
+                            .withDescription("total_segments changed for task " + report.getTaskId())
+                            .asRuntimeException());
+                    return;
+                }
+                taskStartedAt.putIfAbsent(report.getTaskId(), System.currentTimeMillis());
 
                 String key = report.getTaskId() + "/" + report.getSegmentId();
                 progressBySegment.compute(key, (ignored, previous) -> {
@@ -95,12 +118,22 @@ public final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.Coordin
                 System.out.printf("[Coordinator] Aggregate task=%s segments=%d completion=%.1f%% rows=%d%n",
                         report.getTaskId(), taskSegments.size(), aggregateCompletion, aggregateRows);
 
-                if ("COMPLETED".equalsIgnoreCase(report.getStatusMessage())) {
+                int expectedCount = expectedSegmentsByTask.get(report.getTaskId());
+                boolean allSegmentsComplete = true;
+                for (int segmentId = 0; segmentId < expectedCount; segmentId++) {
+                    ProgressReport segmentProgress = progressBySegment.get(report.getTaskId() + "/" + segmentId);
+                    if (segmentProgress == null || segmentProgress.getCompletionPercentage() < 100.0f) {
+                        allSegmentsComplete = false;
+                        break;
+                    }
+                }
+                if (allSegmentsComplete) {
                     completedResults.putIfAbsent(report.getTaskId(), TaskResult.newBuilder()
                             .setTaskId(report.getTaskId())
                             .setStatus("COMPLETED")
                             .setOutputLocation("memory://results/" + report.getTaskId())
-                            .setExecutionTimeMs(0)
+                            .setExecutionTimeMs(System.currentTimeMillis()
+                                    - taskStartedAt.getOrDefault(report.getTaskId(), System.currentTimeMillis()))
                             .build());
                 }
             }
@@ -130,22 +163,28 @@ public final class CoordinatorServiceImpl extends CoordinatorServiceGrpc.Coordin
                 .addAllActiveWorkers(activeWorkers);
 
         // Progress is keyed by task/segment, so group it to reconstruct assignments.
-        Map<String, List<ProgressReport>> byTask = new ConcurrentHashMap<>();
+        Map<String, List<ProgressReport>> byTask = new HashMap<>();
         for (ProgressReport progress : progressBySegment.values()) {
             byTask.computeIfAbsent(progress.getTaskId(), ignored -> new ArrayList<>()).add(progress);
         }
         byTask.forEach((taskId, reports) -> {
-            reports.sort(Comparator.comparingInt(ProgressReport::getSegmentId));
-            List<Integer> segments = reports.stream().map(ProgressReport::getSegmentId).toList();
-            String workerId = reports.get(0).getWorkerId();
-            boolean allComplete = reports.stream().allMatch(r -> r.getCompletionPercentage() >= 100.0f);
-            if (allComplete) return;
-            snapshot.addOngoingAssignments(TaskAssignment.newBuilder()
-                    .setTaskId(taskId)
-                    .setAssignedWorkerId(workerId)
-                    .setTotalSegments(segments.size())
-                    .addAllAssignedSegments(segments)
-                    .setAssignedAtTimestamp(0L));
+            if (completedResults.containsKey(taskId)) return;
+            Map<String, List<Integer>> segmentsByWorker = new HashMap<>();
+            for (ProgressReport report : reports) {
+                segmentsByWorker.computeIfAbsent(report.getWorkerId(), ignored -> new ArrayList<>())
+                        .add(report.getSegmentId());
+            }
+            int totalSegments = expectedSegmentsByTask.getOrDefault(taskId, reports.size());
+            long assignedAt = taskStartedAt.getOrDefault(taskId, 0L);
+            segmentsByWorker.forEach((workerId, segments) -> {
+                segments.sort(Integer::compareTo);
+                snapshot.addOngoingAssignments(TaskAssignment.newBuilder()
+                        .setTaskId(taskId)
+                        .setAssignedWorkerId(workerId)
+                        .setTotalSegments(totalSegments)
+                        .addAllAssignedSegments(segments)
+                        .setAssignedAtTimestamp(assignedAt));
+            });
         });
         snapshot.addAllCompletedResults(completedResults.values());
 
