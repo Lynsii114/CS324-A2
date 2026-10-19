@@ -1,0 +1,194 @@
+/*
+ * Project stylesheet for the JavaFX client dashboard.
+ * Layered on top of the AtlantaFX base theme (applied programmatically),
+ * it defines the colour palette, the enlarged typography and the reusable
+ * widget classes (card, pill, section, event timeline, ...).
+ */
+
+.root {
+    -fx-font-size: 16px;
+    -fx-background-color: #F5F7FA;
+    -fx-accent: #2F6FED;
+    -fx-focus-color: #2F6FED;
+    -fx-faint-focus-color: rgba(47, 111, 237, 0.16);
+}
+
+/* ----------------------------- headings ------------------------------ */
+
+.title-text {
+    -fx-font-size: 30px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #1F2328;
+}
+.subtitle-text {
+    -fx-font-size: 16px;
+    -fx-text-fill: #5A6474;
+}
+.muted {
+    -fx-text-fill: #5A6474;
+}
+.text-ok   { -fx-text-fill: #1A7F37; }
+.text-warn { -fx-text-fill: #9A6700; }
+.text-bad  { -fx-text-fill: #CF222E; }
+
+/* ------------------------------- cards -------------------------------- */
+
+.card {
+    -fx-background-color: white;
+    -fx-background-radius: 14;
+    -fx-border-color: #E1E4EB;
+    -fx-border-radius: 14;
+    -fx-border-width: 1;
+    -fx-padding: 16 18 16 18;
+    -fx-effect: dropshadow(gaussian, rgba(31, 35, 40, 0.08), 12, 0.5, 0, 3);
+}
+.card-title {
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #5A6474;
+}
+.card-value {
+    -fx-font-size: 30px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #1F2328;
+}
+.card-value-accent { -fx-text-fill: #2F6FED; }
+.card-value-success { -fx-text-fill: #1A7F37; }
+.card-value-warning { -fx-text-fill: #9A6700; }
+.card-value-danger { -fx-text-fill: #CF222E; }
+.card-detail {
+    -fx-font-size: 14px;
+    -fx-text-fill: #5A6474;
+}
+
+/* ---------------------------- status pills ----------------------------- */
+
+.pill {
+    -fx-font-size: 16px;
+    -fx-font-weight: bold;
+    -fx-padding: 7 16 7 16;
+    -fx-background-radius: 999;
+    -fx-border-radius: 999;
+    -fx-border-width: 1.5;
+    -fx-alignment: CENTER;
+}
+.pill-idle    { -fx-background-color: #EFF1F5; -fx-text-fill: #5A6474; -fx-border-color: #C9CFDA; }
+.pill-accent  { -fx-background-color: #E4EDFF; -fx-text-fill: #2F6FED; -fx-border-color: #2F6FED; }
+.pill-success { -fx-background-color: #E4F3E9; -fx-text-fill: #1A7F37; -fx-border-color: #1A7F37; }
+.pill-warning { -fx-background-color: #FCF1D6; -fx-text-fill: #9A6700; -fx-border-color: #9A6700; }
+.pill-danger  { -fx-background-color: #FBE6E7; -fx-text-fill: #CF222E; -fx-border-color: #CF222E; }
+
+/* --------------------------- section panels --------------------------- */
+
+.section {
+    -fx-background-color: white;
+    -fx-background-radius: 14;
+    -fx-border-color: #E1E4EB;
+    -fx-border-radius: 14;
+    -fx-border-width: 1;
+}
+.section-title {
+    -fx-font-size: 17px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #1F2328;
+}
+
+/* -------------------------- event timeline ---------------------------- */
+
+.event-list {
+    -fx-background-color: white;
+    -fx-background-insets: 0;
+    -fx-border-color: transparent;
+}
+.event-list .list-cell {
+    -fx-background-color: white;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+    -fx-border-width: 0 0 1 0;
+    -fx-border-color: #F0F2F6;
+}
+.event-cell {
+    -fx-padding: 9 10 9 10;
+}
+.event-time {
+    -fx-font-size: 13px;
+    -fx-text-fill: #5A6474;
+    -fx-font-family: "Monospaced";
+}
+.event-msg         { -fx-font-size: 15px; -fx-text-fill: #1F2328; }
+.event-msg-info    { -fx-text-fill: #1F2328; }
+.event-msg-success { -fx-text-fill: #1A7F37; -fx-font-weight: bold; }
+.event-msg-warning { -fx-text-fill: #9A6700; -fx-font-weight: bold; }
+.event-msg-danger  { -fx-text-fill: #CF222E; -fx-font-weight: bold; }
+
+/* ------------------------------- tables -------------------------------- */
+
+.table-view {
+    -fx-font-size: 16px;
+    -fx-background-radius: 10;
+    -fx-border-radius: 10;
+}
+.table-view > .virtual-flow > .clipped-container > .sheet > .table-row-cell {
+    -fx-cell-size: 42px;
+}
+.table-view .column-header-background {
+    -fx-background-color: #F3F5F9;
+}
+.table-view .column-header,
+.table-view .filler {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+}
+.table-view .column-header .label {
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+    -fx-alignment: center-left;
+}
+.table-cell {
+    -fx-padding: 6 10 6 10;
+    -fx-table-cell-border-color: #EEF0F5;
+}
+
+/* ------------------------------- inputs -------------------------------- */
+
+.text-area,
+.text-field {
+    -fx-font-size: 16px;
+    -fx-background-radius: 10;
+    -fx-border-radius: 10;
+}
+.combo-box {
+    -fx-font-size: 16px;
+}
+.button {
+    -fx-font-size: 16px;
+    -fx-font-weight: bold;
+    -fx-padding: 9 18 9 18;
+    -fx-background-radius: 10;
+}
+
+.log-area {
+    -fx-font-family: "Monospaced";
+    -fx-font-size: 14px;
+    -fx-background-radius: 10;
+    -fx-border-radius: 10;
+}
+
+.mono,
+.mono-input {
+    -fx-font-family: "Monospaced";
+}
+
+.progress-bar > .bar {
+    -fx-background-radius: 999;
+    -fx-background-color: #2F6FED;
+}
+.progress-bar > .track {
+    -fx-background-radius: 999;
+    -fx-background-color: #E7EAF1;
+}
+
+.split-pane-divider {
+    -fx-background-color: transparent;
+    -fx-padding: 0 2 0 2;
+}
