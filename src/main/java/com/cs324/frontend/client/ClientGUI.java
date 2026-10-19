@@ -1,591 +1,1035 @@
 package com.cs324.frontend.client;
 
-import com.cs324.backend.api.BootstrapService;
-import com.cs324.backend.api.WorkerInfo;
-import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
+import com.cs324.backend.grpc.GrpcChannels;
 import com.cs324.backend.worker.WorkerClusterConfig;
-import com.cs324.backend.worker.WorkerServer;
+import com.cs324.backend.worker.WorkerNode;
 import com.cs324.frontend.ui.UITheme;
+import com.cs324.proto.BootstrapServiceGrpc;
+import com.cs324.proto.ClientServiceGrpc;
+import com.cs324.proto.Empty;
+import com.cs324.proto.JobRequest;
+import com.cs324.proto.JobType;
+import com.cs324.proto.TaskStatus;
+import com.cs324.proto.TaskUpdate;
+import com.cs324.proto.WorkerInfo;
+import com.cs324.proto.WorkerProgress;
+import io.grpc.StatusRuntimeException;
 
-import javax.swing.BorderFactory;
-import javax.swing.JButton;
-import javax.swing.JComboBox;
-import javax.swing.JFileChooser;
-import javax.swing.JFrame;
-import javax.swing.JLabel;
-import javax.swing.JOptionPane;
-import javax.swing.JPanel;
-import javax.swing.JScrollPane;
-import javax.swing.JSplitPane;
-import javax.swing.JTable;
-import javax.swing.JTextArea;
-import javax.swing.JTextField;
-import javax.swing.ListSelectionModel;
-import javax.swing.SwingConstants;
-import javax.swing.SwingUtilities;
-import javax.swing.table.AbstractTableModel;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.FlowLayout;
-import java.awt.GridBagConstraints;
-import java.awt.GridBagLayout;
-import java.awt.Insets;
+import atlantafx.base.theme.Styles;
+import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.beans.property.SimpleStringProperty;
+import javafx.beans.property.StringProperty;
+import javafx.beans.value.ObservableValue;
+import javafx.collections.FXCollections;
+import javafx.collections.ObservableList;
+import javafx.geometry.Insets;
+import javafx.geometry.Pos;
+import javafx.scene.Node;
+import javafx.scene.Scene;
+import javafx.scene.control.Alert;
+import javafx.scene.control.Button;
+import javafx.scene.control.ButtonType;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Label;
+import javafx.scene.control.ListCell;
+import javafx.scene.control.ListView;
+import javafx.scene.control.ProgressBar;
+import javafx.scene.control.SelectionMode;
+import javafx.scene.control.SplitPane;
+import javafx.scene.control.TableCell;
+import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableView;
+import javafx.scene.control.TextArea;
+import javafx.scene.control.TextField;
+import javafx.scene.control.Tooltip;
+import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.ColumnConstraints;
+import javafx.scene.layout.GridPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.scene.layout.VBox;
+import javafx.stage.FileChooser;
+import javafx.stage.Stage;
+
+import java.io.File;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 
 /**
- * Client GUI. Runs as its own Java process and talks to the coordinator
- * worker over RMI. Supports manual or CSV input, three job types (MAX,
- * PRIMECOUNT, PRIMESUM) and concurrent submissions from one or more
- * clients at the same time.
+ * Distributed Cluster client - a JavaFX GUI combining JavaFX controls with the
+ * AtlantaFX theme for a modern look and feel.
  *
- * <p>All RMI calls happen on a small background executor, never on the
- * Swing event thread, so the interface never freezes while a job runs.</p>
+ * <p>The dashboard reports the live health of the system:</p>
+ * <ul>
+ *   <li><b>Cluster Server</b> card - RUNNING / FAILURE DETECTED / RECONNECTING /
+ *       RECOVERED / OFFLINE, driven by {@link ClusterMonitor} probes;</li>
+ *   <li><b>Coordinator</b> card - ONLINE / FAILURE DETECTED / RECOVERED with
+ *       failover events;</li>
+ *   <li><b>Workers Online</b> and <b>Jobs</b> cards;</li>
+ *   <li><b>Event timeline</b> - every server failure, reconnect attempt,
+ *       recovery and coordinator event, timestamped.</li>
+ * </ul>
+ *
+ * <p>Jobs ({@code MAX}, {@code PRIMECOUNT}, {@code PRIMESUM}) stream progress
+ * from the coordinator over gRPC; interrupted streams are automatically
+ * re-resolved and resumed from the Bootstrap Node's task ledger.</p>
  */
-public class ClientGUI extends JFrame {
+public class ClientGUI implements ClusterMonitor.Listener {
 
     private static final String[] JOB_TYPES = {"MAX", "PRIMECOUNT", "PRIMESUM"};
-    private static final String[] COLUMNS = {"Job ID", "Type", "Submitted", "Status", "Coordinator", "Workers", "Result", "Error"};
+    private static final int MAX_RESUME_ATTEMPTS = 5;
+    private static final long RESOLVE_WAIT_MS = 2_000;
+    private static final long STREAM_DEADLINE_SECONDS = 15;
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private final JTextField hostField = new JTextField("localhost", 10);
-    private final JTextField bootstrapPortField = new JTextField(String.valueOf(BootstrapServer.DEFAULT_PORT), 6);
-    private final JButton connectButton = new JButton("Connect");
-    private final JLabel connectionStatus = new JLabel("Not connected");
+    // ---------------------------------------------------------------- widgets
+    private final TextField hostField = new TextField("localhost");
+    private final TextField bootstrapPortField =
+            new TextField(String.valueOf(BootstrapServer.DEFAULT_PORT));
+    private final Button connectButton = new Button("Connect");
+    private final Label connectionStatus = new Label("Not connected");
 
-    private final JComboBox<String> jobTypeCombo = new JComboBox<>(JOB_TYPES);
-    private final JTextArea inputArea = new JTextArea(4, 40);
-    private final JButton loadCsvButton = new JButton("Load CSV...");
-    private final JButton submitButton = new JButton("Submit");
-    private final JButton clearButton = new JButton("Clear");
+    private final ComboBox<String> jobTypeCombo = new ComboBox<>();
+    private final TextArea inputArea = new TextArea();
+    private final Button loadCsvButton = new Button("Load CSV...");
+    private final Button submitButton = new Button("Submit");
+    private final Button clearButton = new Button("Clear");
+    private final Label coordinatorLabel = new Label("Coordinator: none");
 
-    // Dashboard widgets.
-    private final JLabel statusPill = new JLabel("  ●  OFFLINE  ");
-    private final JLabel coordinatorValue = new JLabel("None");
-    private final JLabel workersValue = new JLabel("0/" + WorkerClusterConfig.WORKER_COUNT);
-    private final JLabel jobsSubmittedValue = new JLabel("0");
-    private final JLabel coordinatorLabel = new JLabel("Coordinator: none");
+    // Dashboard cards.
+    private final Label serverStatePill = pill("OFFLINE", UITheme.PillState.IDLE);
+    private final Label serverStateDetail = detail("not connected");
+    private final Label coordinatorPill = pill("UNKNOWN", UITheme.PillState.IDLE);
+    private final Label coordinatorValue = bigValue("None");
+    private final Label workersValue = bigValue("0/0");
+    private final Label workersDetail = detail("no membership snapshot yet");
+    private final Label jobsValue = bigValue("0");
+    private final Label jobsDetail = detail("0 done · 0 failed");
+    private final Label lastEventValue = detail("—");
+    private final Label lastEventDetail = detail("no events yet");
 
-    private final JTextArea logArea = new JTextArea(8, 60);
-    private final JTable taskTable = new JTable();
-    private final TaskTableModel tableModel = new TaskTableModel();
+    // Event timeline.
+    private final ObservableList<TimelineEntry> timeline =
+            FXCollections.observableArrayList();
+    private final ListView<TimelineEntry> timelineList = new ListView<>(timeline);
 
-    private final ExecutorService jobExecutor = Executors.newFixedThreadPool(4, runnable -> {
-        Thread thread = new Thread(runnable, "client-job-executor");
-        thread.setDaemon(true);
-        return thread;
+    // Task table + live progress.
+    private final ObservableList<TaskRow> taskRows = FXCollections.observableArrayList();
+    private final TableView<TaskRow> taskTable = new TableView<>(taskRows);
+    private final ObservableList<WorkerRow> workerRows = FXCollections.observableArrayList();
+    private final TableView<WorkerRow> workerTable = new TableView<>(workerRows);
+    private final ProgressBar progressBar = new ProgressBar(0);
+    private final Label progressValue = new Label("—");
+    private final TextArea logArea = new TextArea();
+
+    // ---------------------------------------------------------------- state
+    private final ExecutorService jobExecutor = Executors.newFixedThreadPool(4, r -> {
+        Thread t = new Thread(r, "client-job-executor");
+        t.setDaemon(true);
+        return t;
     });
     private final AtomicInteger jobSequence = new AtomicInteger(0);
-
-    /**
-     * This client's identifier. Sent with every submission so the elected
-     * coordinator can correlate the distributed task back to the client that
-     * asked for it (visible in the Server Manager's task distribution view).
-     */
+    private final AtomicInteger jobsDone = new AtomicInteger(0);
+    private final AtomicInteger jobsFailed = new AtomicInteger(0);
+    private final Map<Integer, TaskState> taskStates = new ConcurrentHashMap<>();
     private final String clientId = "client-" + UUID.randomUUID().toString().substring(0, 8);
 
+    private ClusterMonitor monitor;
     private volatile String bootstrapHost = "localhost";
     private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
-    private volatile BootstrapService bootstrap;
-    private volatile WorkerService coordinator;
-    private volatile int activeWorkerCount;
+    private volatile BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap;
+    private volatile int coordinatorId = WorkerNode.NO_COORDINATOR;
+    private volatile String coordinatorHost = null;
+    private volatile int coordinatorPort = -1;
+    private volatile int clusterSize = WorkerClusterConfig.WORKER_COUNT;
 
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> new ClientGUI().setVisible(true));
+        Application.launch(ClientApp.class, args);
     }
 
-    public ClientGUI() {
-        super("Distributed Client");
+    /**
+     * The JavaFX {@link Application} itself.
+     *
+     * <p>Kept separate from {@link ClientGUI} on purpose: modern JDK launchers
+     * refuse to start a <i>main</i> class that extends
+     * {@code javafx.application.Application} when JavaFX sits only on the
+     * classpath ("JavaFX runtime components are missing"). A plain main class
+     * with a nested application class runs fine with {@code java -cp ...}.</p>
+     */
+    public static final class ClientApp extends Application {
+        @Override
+        public void start(Stage stage) {
+            new ClientGUI().start(stage, getParameters().getRaw());
+        }
+    }
+
+    /** Builds and shows the UI; {@code rawParams} carries the optional {@code [port]} argument. */
+    void start(Stage stage, List<String> rawParams) {
+        if (!rawParams.isEmpty()) {
+            try {
+                bootstrapPortField.setText(
+                        String.valueOf(Integer.parseInt(rawParams.get(0).trim())));
+            } catch (NumberFormatException ignored) {
+                // not a port number - keep the default
+            }
+        }
         UITheme.install();
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(960, 760);
-        setMinimumSize(new java.awt.Dimension(880, 660));
-        setLocationRelativeTo(null);
+        monitor = new ClusterMonitor(this);
 
-        getContentPane().setLayout(new BorderLayout());
-        getContentPane().setBackground(UITheme.BACKGROUND);
-        getContentPane().add(buildDashboard(), BorderLayout.NORTH);
-        getContentPane().add(buildMain(), BorderLayout.CENTER);
+        BorderPane root = new BorderPane();
+        root.setPadding(new Insets(16));
+        root.setTop(buildHeader());
+        root.setCenter(buildBody());
 
-        style();
-
-        connectButton.addActionListener(e -> connect());
-        submitButton.addActionListener(e -> submitJob());
-        loadCsvButton.addActionListener(e -> loadCsv());
-        clearButton.addActionListener(e -> {
-            inputArea.setText("");
-            log("Input cleared");
-        });
-        jobTypeCombo.addActionListener(e -> updateHint());
+        Scene scene = new Scene(root, 1360, 940);
+        UITheme.apply(scene);
+        stage.setTitle("Distributed Cluster Client - " + clientId);
+        stage.setScene(scene);
+        stage.setMinWidth(1080);
+        stage.setMinHeight(760);
+        stage.setOnCloseRequest(e -> shutdown());
+        stage.show();
 
         updateHint();
-        log("Client ready (" + clientId + "). Connect to the Bootstrap Node, then submit jobs "
-                + "(they run in the background).");
+        appendLog("Client ready (" + clientId + "). Connect to the Bootstrap Node, then submit jobs.");
+        appendTimeline(ClusterMonitor.Severity.INFO,
+                "Client started - press Connect to begin health monitoring");
     }
 
-    private void style() {
-        UITheme.button(connectButton);
-        UITheme.button(loadCsvButton);
-        UITheme.button(clearButton);
-        UITheme.button(submitButton);
-        UITheme.textField(hostField);
-        UITheme.textField(bootstrapPortField);
-        UITheme.textArea(inputArea);
-        UITheme.textArea(logArea);
-        UITheme.combo(jobTypeCombo);
-        UITheme.table(taskTable);
-        taskTable.setModel(tableModel);
-        taskTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        taskTable.setAutoCreateRowSorter(true);
-        UITheme.label(connectionStatus, UITheme.MUTED);
-        UITheme.label(coordinatorLabel, UITheme.MUTED);
-        logArea.setEditable(false);
+    private void shutdown() {
+        monitor.shutdown();
+        jobExecutor.shutdownNow();
+        Platform.exit();
     }
 
-    // ---------------------------------------------------------------- dashboard
+    // ---------------------------------------------------------------- header
 
-    private JPanel buildDashboard() {
-        JPanel dashboard = new JPanel(new GridBagLayout());
-        dashboard.setBackground(UITheme.BACKGROUND);
+    private Node buildHeader() {
+        Label title = new Label("Distributed Cluster Client");
+        title.getStyleClass().add("title-text");
+        Label subtitle = new Label(
+                "MAX · PRIMECOUNT · PRIMESUM   ·   live progress   ·   automatic failover & resume");
+        subtitle.getStyleClass().add("subtitle-text");
 
-        JPanel connectionCard = card();
-        statusPill.setFont(UITheme.BIG);
-        statusPill.setForeground(UITheme.ERROR);
-        statusPill.setHorizontalAlignment(SwingConstants.CENTER);
-        statusPill.setOpaque(true);
-        statusPill.setBackground(UITheme.CARD);
-        statusPill.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(UITheme.ERROR, 2),
-                BorderFactory.createEmptyBorder(12, 24, 12, 24)));
-        connectionCard.add(cardTitle("Client Status"), gbc(0, 0, 2));
-        connectionCard.add(statusPill, gbc(0, 1, 2));
-
-        JPanel coordinatorCard = card();
-        coordinatorValue.setFont(UITheme.BIG);
-        coordinatorValue.setForeground(UITheme.TEXT);
-        coordinatorValue.setHorizontalAlignment(SwingConstants.CENTER);
-        coordinatorCard.add(cardTitle("Coordinator (Elected Node)"), gbc(0, 0, 2));
-        coordinatorCard.add(coordinatorValue, gbc(0, 1, 2));
-
-        JPanel statsCard = card();
-        workersValue.setFont(UITheme.BIG);
-        workersValue.setForeground(UITheme.TEXT);
-        workersValue.setHorizontalAlignment(SwingConstants.CENTER);
-        jobsSubmittedValue.setFont(UITheme.BIG);
-        jobsSubmittedValue.setForeground(UITheme.ACCENT);
-        jobsSubmittedValue.setHorizontalAlignment(SwingConstants.CENTER);
-        statsCard.add(cardTitle("Workers Online"), gbc(0, 0, 2));
-        statsCard.add(workersValue, gbc(0, 1, 2));
-        statsCard.add(cardTitle("Jobs Submitted"), gbc(0, 2, 2));
-        statsCard.add(jobsSubmittedValue, gbc(0, 3, 2));
-
-        JPanel titleCard = card();
-        JLabel title = new JLabel("Distributed Client");
-        title.setFont(UITheme.TITLE);
-        title.setForeground(UITheme.TEXT);
-        JLabel subtitle = new JLabel("MAX  ·  PRIMECOUNT  ·  PRIMESUM   (manual or CSV)");
-        subtitle.setFont(UITheme.BASE);
-        subtitle.setForeground(UITheme.MUTED);
-        titleCard.add(title, gbc(0, 0, 2));
-        titleCard.add(subtitle, gbc(0, 1, 2));
-
-        GridBagConstraints g = new GridBagConstraints();
-        g.gridy = 0;
-        g.weightx = 1;
-        g.weighty = 1;
-        g.fill = GridBagConstraints.BOTH;
-        g.insets = new Insets(8, 8, 8, 8);
-        g.gridx = 0;
-        dashboard.add(titleCard, g);
-        g.gridx = 1;
-        dashboard.add(connectionCard, g);
-        g.gridx = 2;
-        dashboard.add(coordinatorCard, g);
-        g.gridx = 3;
-        dashboard.add(statsCard, g);
-        return dashboard;
+        HBox connection = buildConnectionBar();
+        VBox header = new VBox(6, title, subtitle, connection);
+        header.setPadding(new Insets(0, 0, 4, 0));
+        return header;
     }
 
-    private static JPanel card() {
-        JPanel panel = new JPanel(new GridBagLayout());
-        panel.setBackground(UITheme.CARD);
-        panel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(UITheme.BORDER),
-                BorderFactory.createEmptyBorder(10, 10, 10, 10)));
-        return panel;
+    private HBox buildConnectionBar() {
+        Label hostLabel = muted("Bootstrap host");
+        Label portLabel = muted("Port");
+        hostField.setPrefWidth(150);
+        bootstrapPortField.setPrefWidth(90);
+        connectButton.getStyleClass().addAll(Styles.ACCENT, Styles.ROUNDED);
+        connectButton.setOnAction(e -> connect());
+        connectionStatus.getStyleClass().add("muted");
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox bar = new HBox(10, hostLabel, hostField, portLabel, bootstrapPortField,
+                connectButton, connectionStatus, spacer);
+        bar.setAlignment(Pos.CENTER_LEFT);
+        bar.setPadding(new Insets(6, 0, 0, 0));
+        return bar;
     }
 
-    private static JLabel cardTitle(String text) {
-        JLabel label = new JLabel(text);
-        label.setFont(UITheme.SECTION);
-        label.setForeground(UITheme.MUTED);
-        label.setHorizontalAlignment(SwingConstants.CENTER);
+    // -------------------------------------------------------------- dashboard
+
+    private Node buildDashboard() {
+        GridPane grid = new GridPane();
+        grid.setHgap(12);
+        grid.setVgap(12);
+
+        ColumnConstraints c1 = new ColumnConstraints();
+        c1.setPercentWidth(25);
+        ColumnConstraints c2 = new ColumnConstraints();
+        c2.setPercentWidth(25);
+        ColumnConstraints c3 = new ColumnConstraints();
+        c3.setPercentWidth(25);
+        ColumnConstraints c4 = new ColumnConstraints();
+        c4.setPercentWidth(25);
+        grid.getColumnConstraints().addAll(c1, c2, c3, c4);
+
+        VBox serverCard = card("Cluster Server",
+                serverStatePill, serverStateDetail);
+        VBox coordinatorCard = card("Coordinator",
+                coordinatorValue, coordinatorPill);
+        VBox workersCard = card("Workers Online", workersValue, workersDetail);
+        VBox jobsCard = card("Jobs Submitted", jobsValue, jobsDetail);
+
+        grid.add(serverCard, 0, 0);
+        grid.add(coordinatorCard, 1, 0);
+        grid.add(workersCard, 2, 0);
+        grid.add(jobsCard, 3, 0);
+
+        // Full-width timeline card underneath the four status cards.
+        configureTimeline();
+        Label timelineTitle = new Label("Event Timeline  ·  server running · failure detection · reconnect · recovery");
+        timelineTitle.getStyleClass().add("card-title");
+        HBox lastEventRow = new HBox(8, muted("Last event"), lastEventValue, lastEventDetail);
+        lastEventRow.setAlignment(Pos.CENTER_LEFT);
+        VBox timelineCard = cardNode(timelineTitle, lastEventRow, timelineList);
+        VBox.setVgrow(timelineList, Priority.ALWAYS);
+        timelineCard.setMinHeight(150);
+        grid.add(timelineCard, 0, 1, 4, 1);
+
+        VBox wrapper = new VBox(grid);
+        VBox.setVgrow(grid, Priority.ALWAYS);
+        return wrapper;
+    }
+
+    private VBox card(String title, Node... rows) {
+        Label heading = new Label(title);
+        heading.getStyleClass().add("card-title");
+        return cardNode(heading, rows);
+    }
+
+    private VBox cardNode(Node heading, Node... rows) {
+        VBox box = new VBox(8, heading);
+        box.getStyleClass().add("card");
+        box.setPadding(new Insets(14, 16, 14, 16));
+        box.getChildren().addAll(rows);
+        return box;
+    }
+
+    private static Label pill(String text, UITheme.PillState state) {
+        Label label = new Label(text);
+        label.getStyleClass().add("pill");
+        UITheme.setPillState(label, state);
         return label;
     }
 
-    private static GridBagConstraints gbc(int x, int y, int width) {
-        GridBagConstraints c = new GridBagConstraints();
-        c.gridx = x;
-        c.gridy = y;
-        c.gridwidth = width;
-        c.insets = new Insets(4, 4, 4, 4);
-        return c;
+    private static Label bigValue(String text) {
+        Label label = new Label(text);
+        label.getStyleClass().add("card-value");
+        return label;
     }
 
-    // ---------------------------------------------------------------- panels
-
-    private Component buildMain() {
-        JPanel connectionPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
-        connectionPanel.setBackground(UITheme.PANEL);
-        connectionPanel.setBorder(UITheme.titledBorder("Connection"));
-        JLabel hostLabel = new JLabel("Bootstrap host:");
-        UITheme.label(hostLabel, UITheme.MUTED);
-        JLabel portLabel = new JLabel("Port:");
-        UITheme.label(portLabel, UITheme.MUTED);
-        connectionPanel.add(hostLabel);
-        connectionPanel.add(hostField);
-        connectionPanel.add(portLabel);
-        connectionPanel.add(bootstrapPortField);
-        connectionPanel.add(connectButton);
-        connectionPanel.add(connectionStatus);
-
-        JPanel jobPanel = new JPanel(new BorderLayout(8, 8));
-        jobPanel.setBackground(UITheme.PANEL);
-        jobPanel.setBorder(UITheme.titledBorder("Job"));
-
-        JPanel jobHeader = new JPanel(new FlowLayout(FlowLayout.LEFT, 12, 8));
-        jobHeader.setBackground(UITheme.PANEL);
-        JLabel typeLabel = new JLabel("Job type:");
-        UITheme.label(typeLabel, UITheme.MUTED);
-        jobHeader.add(typeLabel);
-        jobHeader.add(jobTypeCombo);
-        jobHeader.add(coordinatorLabel);
-
-        JPanel jobButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 8));
-        jobButtons.setBackground(UITheme.PANEL);
-        jobButtons.add(loadCsvButton);
-        jobButtons.add(clearButton);
-        jobButtons.add(submitButton);
-
-        JPanel inputPanel = new JPanel(new BorderLayout());
-        inputPanel.setBackground(UITheme.PANEL);
-        JScrollPane inputScroll = new JScrollPane(inputArea);
-        UITheme.scroll(inputScroll);
-        inputPanel.add(inputScroll, BorderLayout.CENTER);
-
-        jobPanel.add(jobHeader, BorderLayout.NORTH);
-        jobPanel.add(inputPanel, BorderLayout.CENTER);
-        jobPanel.add(jobButtons, BorderLayout.SOUTH);
-
-        JPanel top = new JPanel(new BorderLayout(8, 8));
-        top.setBackground(UITheme.BACKGROUND);
-        top.add(connectionPanel, BorderLayout.NORTH);
-        top.add(jobPanel, BorderLayout.CENTER);
-
-        JPanel tablePanel = new JPanel(new BorderLayout());
-        tablePanel.setBackground(UITheme.PANEL);
-        tablePanel.setBorder(UITheme.titledBorder("Tasks (concurrent submissions supported)"));
-        JScrollPane tableScroll = new JScrollPane(taskTable);
-        UITheme.scroll(tableScroll);
-        tablePanel.add(tableScroll, BorderLayout.CENTER);
-
-        JPanel logPanel = new JPanel(new BorderLayout());
-        logPanel.setBackground(UITheme.PANEL);
-        logPanel.setBorder(UITheme.titledBorder("Log"));
-        JScrollPane logScroll = new JScrollPane(logArea);
-        UITheme.scroll(logScroll);
-        logPanel.add(logScroll, BorderLayout.CENTER);
-
-        JSplitPane bottom = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePanel, logPanel);
-        bottom.setResizeWeight(0.6);
-        bottom.setBackground(UITheme.BACKGROUND);
-
-        JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT, top, bottom);
-        main.setResizeWeight(0.38);
-        main.setBackground(UITheme.BACKGROUND);
-        return main;
+    private static Label detail(String text) {
+        Label label = new Label(text);
+        label.getStyleClass().add("card-detail");
+        label.setWrapText(true);
+        return label;
     }
 
-    private void updateHint() {
-        String type = (String) jobTypeCombo.getSelectedItem();
-        inputArea.setToolTipText("PRIMESUM".equals(type) ? "start,end  e.g. 1,1000"
-                : "comma-separated integers  e.g. 12,5,99,2,17");
+    private static Label muted(String text) {
+        Label label = new Label(text);
+        label.getStyleClass().add("muted");
+        return label;
     }
 
-    // ---------------------------------------------------------------- connection
+    // ------------------------------------------------------------------ body
+
+    private Node buildBody() {
+        Node dashboard = buildDashboard();
+
+        // Left column: job submission + tasks + live progress.
+        VBox jobCard = buildJobCard();
+        VBox taskCard = buildTaskCard();
+        VBox progressCard = buildProgressCard();
+        VBox left = new VBox(12, jobCard, taskCard, progressCard);
+        VBox.setVgrow(taskCard, Priority.ALWAYS);
+
+        // Right column: event log.
+        VBox logCard = buildLogCard();
+
+        SplitPane rightSplit = new SplitPane(left, logCard);
+        rightSplit.setDividerPositions(0.74);
+
+        SplitPane mainSplit = new SplitPane(dashboard, rightSplit);
+        mainSplit.setDividerPositions(0.34);
+        VBox.setVgrow(mainSplit, Priority.ALWAYS);
+
+        VBox body = new VBox(12, mainSplit);
+        VBox.setVgrow(mainSplit, Priority.ALWAYS);
+        return body;
+    }
+
+    private VBox buildJobCard() {
+        Label heading = new Label("Submit Job");
+        heading.getStyleClass().add("card-title");
+
+        jobTypeCombo.getItems().addAll(JOB_TYPES);
+        jobTypeCombo.setValue("PRIMESUM");
+        jobTypeCombo.valueProperty().addListener((o, a, b) -> updateHint());
+        coordinatorLabel.getStyleClass().add("muted");
+
+        inputArea.setPrefRowCount(3);
+        inputArea.setWrapText(true);
+        inputArea.getStyleClass().add("mono-input");
+
+        loadCsvButton.getStyleClass().add(Styles.FLAT);
+        loadCsvButton.setOnAction(e -> loadCsv());
+        submitButton.getStyleClass().addAll(Styles.ACCENT, Styles.ROUNDED);
+        submitButton.setOnAction(e -> submitJob());
+        clearButton.getStyleClass().add(Styles.FLAT);
+        clearButton.setOnAction(e -> {
+            inputArea.clear();
+            appendLog("Input cleared");
+        });
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox buttons = new HBox(10, loadCsvButton, submitButton, clearButton, spacer);
+        buttons.setAlignment(Pos.CENTER_LEFT);
+
+        Region gap = new Region();
+        HBox.setHgrow(gap, Priority.ALWAYS);
+        HBox typeRow = new HBox(10, muted("Job type"), jobTypeCombo, gap, coordinatorLabel);
+        typeRow.setAlignment(Pos.CENTER_LEFT);
+
+        VBox box = new VBox(10, heading, typeRow, inputArea, buttons);
+        box.getStyleClass().add("card");
+        box.setPadding(new Insets(14, 16, 14, 16));
+        return box;
+    }
+
+    private VBox buildTaskCard() {
+        Label heading = new Label("Tasks  ·  concurrent submissions supported");
+        heading.getStyleClass().add("card-title");
+
+        taskTable.setPlaceholder(new Label("No jobs submitted yet"));
+        taskTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
+        taskTable.setPrefHeight(260);
+        taskTable.getSelectionModel().setSelectionMode(SelectionMode.SINGLE);
+        taskTable.getSelectionModel().selectedItemProperty().addListener((o, a, b) -> {
+            if (b != null) {
+                showSelectedProgress(b);
+            }
+        });
+
+        TableColumn<TaskRow, String> idCol = textColumn("Job", r -> r.id, 60);
+        TableColumn<TaskRow, String> typeCol = textColumn("Type", r -> r.type, 110);
+        TableColumn<TaskRow, String> submittedCol = textColumn("Submitted", r -> r.submitted, 90);
+        TableColumn<TaskRow, String> statusCol = textColumn("Status", r -> r.status, 130);
+        TableColumn<TaskRow, String> coordinatorCol = textColumn("Coordinator", r -> r.coordinator, 100);
+        TableColumn<TaskRow, String> workersCol = textColumn("Workers", r -> r.workers, 110);
+        TableColumn<TaskRow, String> resultCol = textColumn("Result", r -> r.result, 130);
+        TableColumn<TaskRow, String> errorCol = textColumn("Error", r -> r.error, 160);
+
+        // Colour the Status cell: green when done, red when failed, amber while running.
+        statusCol.setCellFactory(col -> new TableCell<>() {
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                getStyleClass().removeAll("text-ok", "text-warn", "text-bad");
+                if (empty || item == null) {
+                    setText(null);
+                    return;
+                }
+                setText(item);
+                if (item.startsWith("Done")) {
+                    UITheme.addStyle(this, "text-ok");
+                } else if (item.startsWith("Failed")) {
+                    UITheme.addStyle(this, "text-bad");
+                } else if (item.startsWith("Running")) {
+                    UITheme.addStyle(this, "text-warn");
+                }
+            }
+        });
+
+        taskTable.getColumns().addAll(idCol, typeCol, submittedCol, statusCol,
+                coordinatorCol, workersCol, resultCol, errorCol);
+
+        VBox box = new VBox(10, heading, taskTable);
+        box.getStyleClass().add("card");
+        box.setPadding(new Insets(14, 16, 14, 16));
+        VBox.setVgrow(taskTable, Priority.ALWAYS);
+        return box;
+    }
+
+    private VBox buildProgressCard() {
+        Label heading = new Label("Live Progress  ·  select a task row for its worker drill-down");
+        heading.getStyleClass().add("card-title");
+
+        progressBar.setPrefWidth(Double.MAX_VALUE);
+        progressBar.setMinHeight(18);
+        HBox.setHgrow(progressBar, Priority.ALWAYS);
+        progressValue.getStyleClass().add("mono");
+        progressValue.setMinWidth(64);
+        progressValue.setAlignment(Pos.CENTER_RIGHT);
+
+        HBox barRow = new HBox(10, progressBar, progressValue);
+        barRow.setAlignment(Pos.CENTER_LEFT);
+
+        workerTable.setPlaceholder(new Label("Select a task to inspect its workers"));
+        workerTable.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
+        workerTable.setPrefHeight(150);
+
+        TableColumn<WorkerRow, String> wId = textColumn("Worker", r -> r.workerId, 80);
+        TableColumn<WorkerRow, String> wAssigned = textColumn("Assigned", r -> r.assigned, 90);
+        TableColumn<WorkerRow, String> wCompleted = textColumn("Completed", r -> r.completed, 95);
+        TableColumn<WorkerRow, String> wJac = textColumn("JAC", r -> r.jac, 70);
+        TableColumn<WorkerRow, String> wOnline = textColumn("Online", r -> r.online, 85);
+        TableColumn<WorkerRow, String> wStatus = textColumn("Status", r -> r.status, 150);
+        workerTable.getColumns().addAll(wId, wAssigned, wCompleted, wJac, wOnline, wStatus);
+
+        VBox box = new VBox(10, heading, barRow, workerTable);
+        box.getStyleClass().add("card");
+        box.setPadding(new Insets(14, 16, 14, 16));
+        return box;
+    }
+
+    private VBox buildLogCard() {
+        Label heading = new Label("Log");
+        heading.getStyleClass().add("card-title");
+
+        logArea.setEditable(false);
+        logArea.setWrapText(true);
+        logArea.setPrefRowCount(10);
+        logArea.getStyleClass().add("log-area");
+
+        VBox box = new VBox(10, heading, logArea);
+        box.getStyleClass().add("card");
+        box.setPadding(new Insets(14, 16, 14, 16));
+        VBox.setVgrow(logArea, Priority.ALWAYS);
+        return box;
+    }
+
+    // ------------------------------------------------------- cluster monitor
+
+    /** Configures the event timeline list (severity-coloured custom cells). */
+    private void configureTimeline() {
+        timelineList.getStyleClass().add("event-list");
+        timelineList.setCellFactory(lv -> new ListCell<TimelineEntry>() {
+            private final Label time = new Label();
+            private final Label msg = new Label();
+            private final HBox box = new HBox(10, time, msg);
+
+            {
+                time.getStyleClass().add("event-time");
+                msg.getStyleClass().add("event-msg");
+                msg.setWrapText(true);
+                HBox.setHgrow(msg, Priority.ALWAYS);
+                box.getStyleClass().add("event-cell");
+                box.setAlignment(Pos.CENTER_LEFT);
+            }
+
+            @Override
+            protected void updateItem(TimelineEntry item, boolean empty) {
+                super.updateItem(item, empty);
+                if (empty || item == null) {
+                    setText(null);
+                    setGraphic(null);
+                    return;
+                }
+                time.setText(item.time());
+                msg.setText(item.message());
+                msg.getStyleClass().removeAll("event-msg-info", "event-msg-success",
+                        "event-msg-warning", "event-msg-danger");
+                msg.getStyleClass().add(switch (item.severity()) {
+                    case SUCCESS -> "event-msg-success";
+                    case WARNING -> "event-msg-warning";
+                    case ERROR -> "event-msg-danger";
+                    default -> "event-msg-info";
+                });
+                setGraphic(box);
+            }
+        });
+    }
+
+    /**
+     * Server lifecycle (RUNNING / FAILURE DETECTED / RECONNECTING / RECOVERED /
+     * OFFLINE) reported by {@link ClusterMonitor} on its probe thread.
+     */
+    @Override
+    public void onServerState(ClusterMonitor.ServerState state, String detail,
+                              int consecutiveFailures, long outageMs) {
+        Platform.runLater(() -> {
+            switch (state) {
+                case OFFLINE -> setServerPill("OFFLINE", UITheme.PillState.IDLE, "not connected");
+                case RUNNING -> setServerPill("RUNNING", UITheme.PillState.SUCCESS, detail);
+                case FAILURE_DETECTED -> setServerPill("FAILURE DETECTED", UITheme.PillState.DANGER, detail);
+                case RECONNECTING -> setServerPill("RECONNECTING", UITheme.PillState.WARNING,
+                        "attempt " + consecutiveFailures + " · down for "
+                                + ClusterMonitor.formatDuration(outageMs));
+                case RECOVERED -> setServerPill("RECOVERED", UITheme.PillState.SUCCESS, detail);
+            }
+        });
+    }
+
+    private void setServerPill(String text, UITheme.PillState state, String detailText) {
+        serverStatePill.setText(text);
+        UITheme.setPillState(serverStatePill, state);
+        serverStateDetail.setText(detailText);
+    }
+
+    /** Coordinator lifecycle (failover / recovery) reported by the monitor. */
+    @Override
+    public void onCoordinatorState(ClusterMonitor.CoordinatorState state, String detail) {
+        Platform.runLater(() -> {
+            switch (state) {
+                case UNKNOWN -> {
+                    coordinatorPill.setText("UNKNOWN");
+                    UITheme.setPillState(coordinatorPill, UITheme.PillState.IDLE);
+                }
+                case ONLINE -> {
+                    coordinatorPill.setText("ONLINE");
+                    UITheme.setPillState(coordinatorPill, UITheme.PillState.SUCCESS);
+                }
+                case FAILURE_DETECTED -> {
+                    coordinatorPill.setText("FAILURE DETECTED");
+                    UITheme.setPillState(coordinatorPill, UITheme.PillState.DANGER);
+                }
+                case RECOVERED -> {
+                    coordinatorPill.setText("RECOVERED");
+                    UITheme.setPillState(coordinatorPill, UITheme.PillState.SUCCESS);
+                }
+            }
+        });
+    }
+
+    /** Fresh worker membership snapshot (online/expected counts + registered list). */
+    @Override
+    public void onWorkersSnapshot(int online, int total, List<WorkerInfo> workers) {
+        Platform.runLater(() -> {
+            workersValue.setText(online + "/" + total);
+            workersDetail.setText(workers.size() + " registered · updated "
+                    + LocalTime.now().format(CLOCK));
+        });
+    }
+
+    /** Timeline event emitted by the monitor (state changes, failures, recovery). */
+    @Override
+    public void onEvent(ClusterMonitor.Severity severity, String message) {
+        Platform.runLater(() -> appendTimeline(severity, message));
+    }
+
+    // ------------------------------------------------------------- connection
 
     private void connect() {
-        bootstrapHost = hostField.getText().trim().isEmpty() ? "localhost" : hostField.getText().trim();
+        String host = hostField.getText().trim();
+        bootstrapHost = host.isEmpty() ? "localhost" : host;
         try {
             bootstrapPort = Integer.parseInt(bootstrapPortField.getText().trim());
         } catch (NumberFormatException e) {
-            appendError("Bootstrap port must be a number");
+            showError("Bootstrap port must be a number");
             return;
         }
 
-        connectButton.setEnabled(false);
-        connectionStatus.setForeground(UITheme.WARNING);
+        connectButton.setDisable(true);
         connectionStatus.setText("Connecting...");
         jobExecutor.submit(this::doConnect);
     }
 
     private void doConnect() {
         try {
-            Registry registry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-            BootstrapService foundBootstrap = (BootstrapService) registry.lookup(BootstrapServer.SERVICE_NAME);
+            BootstrapServiceGrpc.BootstrapServiceBlockingStub foundBootstrap =
+                    GrpcChannels.bootstrap(bootstrapHost, bootstrapPort);
             bootstrap = foundBootstrap;
-            List<WorkerInfo> active = foundBootstrap.getActiveWorkers();
-            activeWorkerCount = active.size();
-            int coordinatorId = findCoordinatorId(foundBootstrap);
-            WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
-                    ? null
-                    : lookupRegistered(foundBootstrap, coordinatorId);
-            coordinator = found;
-            final int elected = coordinatorId;
-            SwingUtilities.invokeLater(() -> {
-                connectButton.setEnabled(true);
-                workersValue.setText(activeWorkerCount + "/" + WorkerClusterConfig.WORKER_COUNT);
-                if (elected == WorkerService.NO_COORDINATOR) {
-                    connectionStatus.setForeground(UITheme.WARNING);
+            List<WorkerInfo> active =
+                    foundBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
+            final int registered = active.size();
+            try {
+                clusterSize = foundBootstrap.getClusterSize(Empty.getDefaultInstance()).getSize();
+            } catch (Exception e) {
+                clusterSize = Math.max(registered, WorkerClusterConfig.WORKER_COUNT);
+            }
+            final int elected = refreshCoordinator() ? coordinatorId : WorkerNode.NO_COORDINATOR;
+
+            // Health dashboard starts probing the server from here on.
+            monitor.start(bootstrapHost, bootstrapPort);
+
+            Platform.runLater(() -> {
+                connectButton.setDisable(false);
+                workersValue.setText(registered + "/" + clusterSize);
+                if (elected == WorkerNode.NO_COORDINATOR) {
                     connectionStatus.setText("Connected - no coordinator yet");
-                    coordinatorLabel.setText("Coordinator: none (workers are electing...)");
-                    coordinatorValue.setText("None");
-                    coordinatorValue.setForeground(UITheme.WARNING);
-                    statusPill.setText("  ●  ELECTING  ");
-                    statusPill.setForeground(UITheme.WARNING);
-                    statusPill.setBorder(BorderFactory.createCompoundBorder(
-                            BorderFactory.createLineBorder(UITheme.WARNING, 2),
-                            BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+                    setCoordinatorUI(WorkerNode.NO_COORDINATOR);
                 } else {
-                    connectionStatus.setForeground(UITheme.SUCCESS);
                     connectionStatus.setText("Online - coordinator worker " + elected);
-                    coordinatorLabel.setText("Coordinator: worker " + elected);
-                    coordinatorValue.setText("Worker " + elected);
-                    coordinatorValue.setForeground(UITheme.SUCCESS);
-                    statusPill.setText("  ●  ONLINE  ");
-                    statusPill.setForeground(UITheme.SUCCESS);
-                    statusPill.setBorder(BorderFactory.createCompoundBorder(
-                            BorderFactory.createLineBorder(UITheme.SUCCESS, 2),
-                            BorderFactory.createEmptyBorder(12, 24, 12, 24)));
+                    setCoordinatorUI(elected);
                 }
-                log("Connected to Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort
-                        + " - " + activeWorkerCount + " worker(s) registered"
-                        + (elected == WorkerService.NO_COORDINATOR ? ", no coordinator elected yet" : ", coordinator is worker " + elected));
+                appendLog("Connected to Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort
+                        + " - " + registered + " worker(s) registered"
+                        + (elected == WorkerNode.NO_COORDINATOR
+                                ? ", no coordinator elected yet"
+                                : ", coordinator is worker " + elected));
             });
         } catch (Exception e) {
-            SwingUtilities.invokeLater(() -> {
-                connectButton.setEnabled(true);
-                connectionStatus.setForeground(UITheme.ERROR);
+            Platform.runLater(() -> {
+                connectButton.setDisable(false);
                 connectionStatus.setText("Connection failed");
-                appendError("Could not connect: " + rootMessage(e));
+                showError("Could not connect: " + ClusterMonitor.rootMessage(e));
             });
         }
     }
 
     /**
      * Asks every registered worker which coordinator it knows and returns the
-     * agreed coordinator id (or {@link WorkerService#NO_COORDINATOR} if none).
+     * agreed coordinator id (or {@link WorkerNode#NO_COORDINATOR} if none).
      */
-    private int findCoordinatorId(BootstrapService bootstrap) throws Exception {
-        for (WorkerInfo info : bootstrap.getActiveWorkers()) {
-            WorkerService worker = lookup(info);
-            if (worker == null) {
+    private int findCoordinatorId(BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap) {
+        List<WorkerInfo> workers =
+                currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
+        int reported = WorkerNode.NO_COORDINATOR;
+        for (WorkerInfo info : workers) {
+            try {
+                int candidate = GrpcChannels.cluster(info.getHost(), info.getPort())
+                        .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
+                        .getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
+                if (candidate != WorkerNode.NO_COORDINATOR) {
+                    reported = candidate;
+                    break;
+                }
+            } catch (Exception ignored) {
+                // worker not answering - try the next one
+            }
+        }
+        if (reported == WorkerNode.NO_COORDINATOR) {
+            return WorkerNode.NO_COORDINATOR;
+        }
+        // Confirm the reported coordinator is alive and self-consistent; a stale
+        // report can otherwise point at a worker that died mid-failover.
+        for (WorkerInfo info : workers) {
+            if (info.getWorkerId() != reported) {
                 continue;
             }
-            int candidate = worker.getCurrentCoordinatorId();
-            if (candidate != WorkerService.NO_COORDINATOR) {
-                return candidate;
+            try {
+                int self = GrpcChannels.cluster(info.getHost(), info.getPort())
+                        .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
+                        .getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
+                return self == reported ? reported : WorkerNode.NO_COORDINATOR;
+            } catch (Exception e) {
+                return WorkerNode.NO_COORDINATOR;
             }
         }
-        return WorkerService.NO_COORDINATOR;
+        return WorkerNode.NO_COORDINATOR;
     }
 
-    private WorkerService lookupRegistered(BootstrapService bootstrap, int workerId) throws Exception {
-        for (WorkerInfo info : bootstrap.getActiveWorkers()) {
+    private static WorkerInfo findWorker(List<WorkerInfo> workers, int workerId) {
+        for (WorkerInfo info : workers) {
             if (info.getWorkerId() == workerId) {
-                WorkerService worker = lookup(info);
-                if (worker != null) {
-                    return worker;
-                }
+                return info;
             }
         }
-        throw new Exception("Coordinator worker " + workerId + " is not reachable");
-    }
-
-    private WorkerService lookup(WorkerInfo info) {
-        try {
-            Registry registry = LocateRegistry.getRegistry(info.getHost(), info.getPort());
-            return (WorkerService) registry.lookup(WorkerServer.SERVICE_NAME_PREFIX + info.getWorkerId());
-        } catch (Exception e) {
-            System.err.println("[Client] cannot reach " + info + ": " + e.getMessage());
-            return null;
-        }
+        return null;
     }
 
     /**
-     * Re-queries the Bootstrap Node for the currently elected coordinator. Used
-     * when a 5-job term ends so the client automatically follows the rotation to
-     * whichever worker is elected next - no manual reconnect needed.
+     * Re-queries the Bootstrap Node for the currently elected coordinator and
+     * points the client's submit path at it. Used on connect and when a stream
+     * breaks because a term ended or the coordinator died.
      */
     private boolean refreshCoordinator() {
-        final BootstrapService currentBootstrap = bootstrap;
+        final BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap = bootstrap;
         if (currentBootstrap == null) {
             return false;
         }
         try {
-            int coordinatorId = findCoordinatorId(currentBootstrap);
-            WorkerService found = coordinatorId == WorkerService.NO_COORDINATOR
-                    ? null
-                    : lookupRegistered(currentBootstrap, coordinatorId);
-            coordinator = found;
-            final int elected = coordinatorId;
-            SwingUtilities.invokeLater(() -> {
-                if (elected == WorkerService.NO_COORDINATOR) {
-                    coordinatorLabel.setText("Coordinator: none (workers are electing...)");
-                    coordinatorValue.setText("None");
-                    coordinatorValue.setForeground(UITheme.WARNING);
-                    statusPill.setText("  ●  ELECTING  ");
-                    statusPill.setForeground(UITheme.WARNING);
-                } else {
-                    coordinatorLabel.setText("Coordinator: worker " + elected);
-                    coordinatorValue.setText("Worker " + elected);
-                    coordinatorValue.setForeground(UITheme.SUCCESS);
-                    statusPill.setText("  ●  ONLINE  ");
-                    statusPill.setForeground(UITheme.SUCCESS);
-                }
-            });
+            List<WorkerInfo> active =
+                    currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
+            int coordId = findCoordinatorId(currentBootstrap);
+            if (coordId == WorkerNode.NO_COORDINATOR) {
+                setCoordinatorUI(WorkerNode.NO_COORDINATOR);
+                return false;
+            }
+            WorkerInfo coordInfo = findWorker(active, coordId);
+            if (coordInfo == null) {
+                return false;
+            }
+            coordinatorId = coordId;
+            coordinatorHost = coordInfo.getHost();
+            coordinatorPort = coordInfo.getPort();
+            setCoordinatorUI(coordId);
             return true;
         } catch (Exception e) {
             return false;
         }
     }
 
-    // ---------------------------------------------------------------- jobs
-
-    private void submitJob() {
-        if (coordinator == null) {
-            appendError("No coordinator - press Connect (workers elect one automatically)");
-            return;
-        }
-
-        String type = (String) jobTypeCombo.getSelectedItem();
-        String raw = inputArea.getText().trim();
-        if (raw.isEmpty()) {
-            appendError("Input is empty");
-            return;
-        }
-
-        final int jobId = jobSequence.incrementAndGet();
-        final String submitted = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-        final WorkerService target = coordinator;
-
-        addTask(jobId, type, submitted, "Running", String.valueOf(currentCoordinatorId(target)), "-", "-", null);
-        jobsSubmittedValue.setText(String.valueOf(jobSequence.get()));
-
-        jobExecutor.submit(() -> {
-            WorkerService targetWorker = target;
-            for (int attempt = 0; attempt < 3; attempt++) {
-                try {
-                    com.cs324.backend.api.TaskResult result = dispatch(targetWorker, type, raw);
-                    String workers = joinWorkerIds(result.getWorkerIds());
-                    String resultText = "task=" + shortTaskId(result.getTaskId()) + " result=" + result.getResult();
-                    updateTask(jobId, "Done", workers, resultText, null);
-                    log("Job " + jobId + " [" + type + "] finished -> " + result);
-                    return;
-                } catch (Exception e) {
-                    String message = rootMessage(e);
-                    boolean coordinatorChanged = attempt < 2 && needsNewCoordinator(message);
-                    if (coordinatorChanged && refreshCoordinator() && coordinator != null) {
-                        log("Term hand-over detected - re-resolving the new coordinator and retrying job " + jobId);
-                        targetWorker = coordinator;
-                        try {
-                            Thread.sleep(1000L);
-                        } catch (InterruptedException ie) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
-                        continue;
-                    }
-                    updateTask(jobId, "Failed", "-", "-",
-                            coordinatorChanged ? message + " (coordinator re-elected)" : message);
-                    log("Job " + jobId + " [" + type + "] failed -> " + message);
-                    return;
-                }
+    /** Updates the coordinator widgets and the monitor's probe target (FX-thread safe). */
+    private void setCoordinatorUI(final int elected) {
+        Platform.runLater(() -> {
+            if (elected == WorkerNode.NO_COORDINATOR) {
+                coordinatorLabel.setText("Coordinator: none (workers are electing...)");
+                coordinatorValue.setText("None");
+                coordinatorPill.setText("ELECTING");
+                UITheme.setPillState(coordinatorPill, UITheme.PillState.WARNING);
+                monitor.clearCoordinator();
+            } else {
+                coordinatorLabel.setText("Coordinator: worker " + elected);
+                coordinatorValue.setText("Worker " + elected);
+                coordinatorPill.setText("ONLINE");
+                UITheme.setPillState(coordinatorPill, UITheme.PillState.SUCCESS);
+                monitor.setCoordinator(elected, coordinatorHost, coordinatorPort);
             }
         });
     }
 
-    private int currentCoordinatorId(WorkerService worker) {
-        try {
-            return worker.getCurrentCoordinatorId();
-        } catch (Exception e) {
-            return WorkerService.NO_COORDINATOR;
-        }
-    }
+    // ------------------------------------------------------------------ jobs
 
-    /** True when the failure means the elected coordinator changed (term ended or not the coordinator). */
-    private boolean needsNewCoordinator(String message) {
-        return message != null && (message.contains("not the coordinator")
-                || message.contains("Coordinator term ended"));
-    }
-
-    private com.cs324.backend.api.TaskResult dispatch(WorkerService target, String type, String raw) throws Exception {
-        switch (type) {
-            case "MAX":
-                return target.submitMaxJob(clientId, parseNumbers(raw));
-            case "PRIMECOUNT":
-                return target.submitPrimeCount(clientId, parseNumbers(raw));
-            case "PRIMESUM":
-                int[] range = parseRange(raw);
-                return target.submitPrimeSum(clientId, range[0], range[1]);
-            default:
-                throw new IllegalArgumentException("Unknown job type: " + type);
-        }
-    }
-
-    private static String joinWorkerIds(List<Integer> workerIds) {
-        if (workerIds == null || workerIds.isEmpty()) {
-            return "-";
-        }
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < workerIds.size(); i++) {
-            if (i > 0) {
-                builder.append(",");
-            }
-            builder.append(workerIds.get(i));
-        }
-        return builder.toString();
-    }
-
-    private static String shortTaskId(String taskId) {
-        return taskId != null && taskId.length() > 8 ? taskId.substring(0, 8) : String.valueOf(taskId);
-    }
-
-    private void loadCsv() {
-        JFileChooser chooser = new JFileChooser();
-        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) {
+    private void submitJob() {
+        if (coordinatorHost == null || coordinatorPort < 0) {
+            showError("No coordinator - press Connect (workers elect one automatically)");
             return;
         }
-        Path path = chooser.getSelectedFile().toPath();
-        try {
-            String content = Files.readString(path).trim();
-            inputArea.setText(content);
-            log("Loaded CSV from " + path.getFileName());
-        } catch (IOException e) {
-            appendError("Could not read CSV file: " + e.getMessage());
+
+        String type = jobTypeCombo.getValue();
+        String raw = inputArea.getText().trim();
+        if (raw.isEmpty()) {
+            showError("Input is empty");
+            return;
         }
+
+        JobRequest request;
+        try {
+            request = buildRequest(type, raw);
+        } catch (Exception e) {
+            showError(ClusterMonitor.rootMessage(e));
+            return;
+        }
+
+        final int jobId = jobSequence.incrementAndGet();
+        final String submitted = LocalTime.now().format(CLOCK);
+        TaskState state = new TaskState();
+        taskStates.put(jobId, state);
+
+        TaskRow row = new TaskRow(jobId, type, submitted);
+        row.status.set("Running 0%");
+        row.coordinator.set(String.valueOf(coordinatorId));
+        addTaskRow(row);
+        jobsValue.setText(String.valueOf(jobSequence.get()));
+        selectTaskRow(jobId);
+        appendLog("Job " + jobId + " [" + type + "] submitted to coordinator worker " + coordinatorId);
+
+        streamJob(jobId, request, state);
+    }
+
+    private JobRequest buildRequest(String type, String raw) {
+        JobRequest.Builder builder = JobRequest.newBuilder().setClientId(clientId);
+        switch (type) {
+            case "MAX" -> builder.setJobType(JobType.MAX).addAllNumbers(parseNumbers(raw));
+            case "PRIMECOUNT" -> builder.setJobType(JobType.PRIMECOUNT).addAllNumbers(parseNumbers(raw));
+            case "PRIMESUM" -> {
+                int[] range = parseRange(raw);
+                builder.setJobType(JobType.PRIMESUM).setRangeStart(range[0]).setRangeEnd(range[1]);
+            }
+            default -> throw new IllegalArgumentException("Unknown job type: " + type);
+        }
+        return builder.build();
+    }
+
+    /** Opens the async gRPC streaming channel to the current coordinator. */
+    private void streamJob(int jobId, JobRequest request, TaskState state) {
+        final String host = coordinatorHost;
+        final int port = coordinatorPort;
+        final ClientServiceGrpc.ClientServiceStub stub = GrpcChannels.clientAsync(host, port)
+                .withDeadlineAfter(STREAM_DEADLINE_SECONDS, TimeUnit.SECONDS);
+        try {
+            stub.submitJob(request, new io.grpc.stub.StreamObserver<TaskUpdate>() {
+                @Override
+                public void onNext(TaskUpdate update) {
+                    Platform.runLater(() -> handleProgress(jobId, update, state));
+                }
+
+                @Override
+                public void onError(Throwable t) {
+                    Platform.runLater(() -> handleStreamError(jobId, request, state, t));
+                }
+
+                @Override
+                public void onCompleted() {
+                    // final onNext (TASK_DONE) already rendered the outcome
+                }
+            });
+        } catch (Exception e) {
+            Platform.runLater(() -> handleStreamError(jobId, request, state, e));
+        }
+    }
+
+    private void handleProgress(int jobId, TaskUpdate update, TaskState state) {
+        state.taskId = update.getTaskId();
+        state.percent = update.getPercent();
+        state.workers = workerRows(update);
+        state.usedWorkers = update.getUsedWorkerIdsList();
+        state.coordinatorId = update.getCoordinatorId();
+
+        TaskStatus status = update.getStatus();
+        if (status == TaskStatus.TASK_DONE) {
+            String result = "result=" + update.getResult();
+            jobsDone.incrementAndGet();
+            updateJobsDetail();
+            updateTaskRow(jobId, "Done", String.valueOf(update.getCoordinatorId()),
+                    joinIds(state.usedWorkers), result, null);
+            appendLog("Job " + jobId + " [" + update.getJobType() + "] finished -> " + result);
+        } else if (status == TaskStatus.TASK_FAILED) {
+            jobsFailed.incrementAndGet();
+            updateJobsDetail();
+            updateTaskRow(jobId, "Failed", String.valueOf(update.getCoordinatorId()),
+                    "-", "-", update.getMessage());
+            appendLog("Job " + jobId + " failed -> " + update.getMessage());
+        } else {
+            updateTaskRow(jobId, "Running " + update.getPercent() + "%",
+                    String.valueOf(update.getCoordinatorId()),
+                    joinIds(state.usedWorkers), "-", null);
+        }
+        if (isSelectedTask(jobId)) {
+            renderProgress(jobId, state);
+        }
+    }
+
+    /** Stream broke: coordinator term ended, coordinator died, or another transport failure. */
+    private void handleStreamError(int jobId, JobRequest request, TaskState state, Throwable t) {
+        String message = ClusterMonitor.rootMessage(t);
+        if (shouldResumeAfter(t, message)) {
+            state.attempt++;
+            if (state.attempt > MAX_RESUME_ATTEMPTS) {
+                jobsFailed.incrementAndGet();
+                updateJobsDetail();
+                updateTaskRow(jobId, "Failed", "-", "-", "-", message + " (coordinator re-elected)");
+                appendLog("Job " + jobId + " failed after " + MAX_RESUME_ATTEMPTS
+                        + " resume attempt(s) -> " + message);
+                return;
+            }
+            appendLog("Stream interrupted (attempt " + state.attempt + "): " + message
+                    + " - re-resolving the coordinator and resuming job " + jobId);
+            final TaskState captured = state;
+            jobExecutor.submit(() -> {
+                boolean resolved = false;
+                for (int i = 0; i < MAX_RESUME_ATTEMPTS && !resolved; i++) {
+                    resolved = refreshCoordinator() && coordinatorId != WorkerNode.NO_COORDINATOR;
+                    if (!resolved) {
+                        try {
+                            Thread.sleep(RESOLVE_WAIT_MS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            break;
+                        }
+                    }
+                }
+                final boolean ok = resolved;
+                final String resumeTaskId = captured.taskId == null ? "" : captured.taskId;
+                Platform.runLater(() -> {
+                    if (ok) {
+                        JobRequest resume = request.toBuilder().setResumeTaskId(resumeTaskId).build();
+                        appendLog("Resuming job " + jobId + " from task " + shortTaskId(resumeTaskId)
+                                + " via coordinator worker " + coordinatorId);
+                        streamJob(jobId, resume, captured);
+                    } else {
+                        jobsFailed.incrementAndGet();
+                        updateJobsDetail();
+                        updateTaskRow(jobId, "Failed", "-", "-", "-", message);
+                        appendLog("Job " + jobId
+                                + " failed - no coordinator could be resolved -> " + message);
+                    }
+                });
+            });
+        } else {
+            jobsFailed.incrementAndGet();
+            updateJobsDetail();
+            updateTaskRow(jobId, "Failed", "-", "-", "-", message);
+            appendLog("Job " + jobId + " failed -> " + message);
+        }
+    }
+
+    private boolean shouldResumeAfter(Throwable t, String message) {
+        if (message != null && (message.contains("not the coordinator")
+                || message.contains("Coordinator term ended"))) {
+            return true;
+        }
+        if (t instanceof StatusRuntimeException sre) {
+            return sre.getStatus().getCode() == io.grpc.Status.Code.UNAVAILABLE
+                    || sre.getStatus().getCode() == io.grpc.Status.Code.DEADLINE_EXCEEDED
+                    || sre.getStatus().getCode() == io.grpc.Status.Code.CANCELLED;
+        }
+        return false;
+    }
+
+    private List<WorkerRow> workerRows(TaskUpdate update) {
+        List<WorkerRow> rows = new ArrayList<>();
+        for (WorkerProgress wp : update.getWorkersList()) {
+            rows.add(new WorkerRow(wp.getWorkerId(), wp.getTasksAssigned(), wp.getTasksCompleted(),
+                    wp.getJac(), wp.getOnline(), wp.getStatus()));
+        }
+        return rows;
+    }
+
+    // -------------------------------------------------------- progress view
+
+    private void showSelectedProgress(TaskRow row) {
+        TaskState state = taskStates.get(row.jobId);
+        if (state == null) {
+            progressBar.setProgress(0);
+            progressValue.setText("—");
+            workerRows.setAll();
+            return;
+        }
+        renderProgress(row.jobId, state);
+    }
+
+    private void renderProgress(int jobId, TaskState state) {
+        progressBar.setProgress(state.percent / 100.0);
+        progressValue.setText(state.percent + "%");
+        workerRows.setAll(state.workers);
+    }
+
+    private boolean isSelectedTask(int jobId) {
+        TaskRow selected = taskTable.getSelectionModel().getSelectedItem();
+        return selected != null && selected.jobId == jobId;
+    }
+
+    private void selectTaskRow(int jobId) {
+        for (int i = 0; i < taskRows.size(); i++) {
+            if (taskRows.get(i).jobId == jobId) {
+                taskTable.getSelectionModel().select(i);
+                taskTable.scrollTo(i);
+                return;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------- input parsing
+
+    private void loadCsv() {
+        FileChooser chooser = new FileChooser();
+        chooser.setTitle("Load CSV input");
+        chooser.getExtensionFilters().addAll(
+                new FileChooser.ExtensionFilter("CSV / text files", "*.csv", "*.txt"),
+                new FileChooser.ExtensionFilter("All files", "*.*"));
+        Stage owner = inputArea.getScene() == null
+                ? null : (Stage) inputArea.getScene().getWindow();
+        File file = chooser.showOpenDialog(owner);
+        if (file == null) {
+            return;
+        }
+        try {
+            String content = Files.readString(file.toPath()).trim();
+            inputArea.setText(content);
+            appendLog("Loaded CSV from " + file.getName());
+        } catch (IOException e) {
+            showError("Could not read CSV file: " + e.getMessage());
+        }
+    }
+
+    private void updateHint() {
+        String type = jobTypeCombo.getValue();
+        if (type == null) {
+            return;
+        }
+        String hint = "PRIMESUM".equals(type)
+                ? "start,end  e.g. 1,1000"
+                : "comma-separated integers  e.g. 12,5,99,2,17";
+        inputArea.setPromptText(hint);
+        inputArea.setTooltip(new Tooltip(hint));
     }
 
     /** Parses "12,5,99,2,17" into a list of integers. */
@@ -623,78 +1067,171 @@ public class ClientGUI extends JFrame {
         return parts;
     }
 
-    private String rootMessage(Throwable t) {
-        Throwable current = t;
-        while (current.getCause() != null) {
-            current = current.getCause();
+    // ---------------------------------------------------------------- helpers
+
+    private void addTaskRow(TaskRow row) {
+        if (Platform.isFxApplicationThread()) {
+            taskRows.add(row);
+        } else {
+            Platform.runLater(() -> taskRows.add(row));
         }
-        String message = current.getMessage();
-        return message == null ? current.getClass().getSimpleName() : message;
     }
 
-    private void addTask(int jobId, String type, String submitted, String status, String coordinator, String workers, String result, String error) {
-        SwingUtilities.invokeLater(() -> tableModel.addRow(jobId, type, submitted, status, coordinator, workers, result, error));
-    }
-
-    private void updateTask(int jobId, String status, String workers, String result, String error) {
-        SwingUtilities.invokeLater(() -> tableModel.updateRow(jobId, status, workers, result, error));
-    }
-
-    private void log(String message) {
-        logArea.append("[" + LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss")) + "] " + message + "\n");
-        logArea.setCaretPosition(logArea.getDocument().getLength());
-    }
-
-    private void appendError(String message) {
-        log("ERROR: " + message);
-        JOptionPane.showMessageDialog(this, message, "Error", JOptionPane.ERROR_MESSAGE);
-    }
-
-    /** Non-editable table model for submitted tasks. */
-    private static final class TaskTableModel extends AbstractTableModel {
-        private final List<Object[]> rows = new ArrayList<>();
-
-        @Override
-        public int getRowCount() {
-            return rows.size();
-        }
-
-        @Override
-        public int getColumnCount() {
-            return COLUMNS.length;
-        }
-
-        @Override
-        public String getColumnName(int column) {
-            return COLUMNS[column];
-        }
-
-        @Override
-        public Object getValueAt(int rowIndex, int columnIndex) {
-            return rows.get(rowIndex)[columnIndex];
-        }
-
-        @Override
-        public boolean isCellEditable(int rowIndex, int columnIndex) {
-            return false;
-        }
-
-        void addRow(int jobId, String type, String submitted, String status, String coordinator, String workers, String result, String error) {
-            rows.add(new Object[]{jobId, type, submitted, status, coordinator, workers, result, error});
-            fireTableRowsInserted(rows.size() - 1, rows.size() - 1);
-        }
-
-        void updateRow(int jobId, String status, String workers, String result, String error) {
-            for (int i = 0; i < rows.size(); i++) {
-                if ((Integer) rows.get(i)[0] == jobId) {
-                    rows.get(i)[3] = status;
-                    rows.get(i)[5] = workers;
-                    rows.get(i)[6] = result;
-                    rows.get(i)[7] = error;
-                    fireTableRowsUpdated(i, i);
+    private void updateTaskRow(int jobId, String status, String coordinator,
+                               String workers, String result, String error) {
+        Runnable update = () -> {
+            for (TaskRow row : taskRows) {
+                if (row.jobId == jobId) {
+                    row.status.set(status);
+                    row.coordinator.set(coordinator);
+                    row.workers.set(workers == null ? "-" : workers);
+                    row.result.set(result == null ? "-" : result);
+                    row.error.set(error == null ? "" : error);
                     return;
                 }
             }
+        };
+        if (Platform.isFxApplicationThread()) {
+            update.run();
+        } else {
+            Platform.runLater(update);
+        }
+    }
+
+    private void updateJobsDetail() {
+        String text = jobsDone.get() + " done · " + jobsFailed.get() + " failed";
+        if (Platform.isFxApplicationThread()) {
+            jobsDetail.setText(text);
+        } else {
+            Platform.runLater(() -> jobsDetail.setText(text));
+        }
+    }
+
+    private void appendLog(String message) {
+        if (!Platform.isFxApplicationThread()) {
+            Platform.runLater(() -> appendLog(message));
+            return;
+        }
+        logArea.appendText("[" + LocalTime.now().format(CLOCK) + "] " + message + "\n");
+        logArea.positionCaret(logArea.getLength());
+    }
+
+    /** Adds a timestamped, severity-coloured entry to the dashboard timeline + log. */
+    private void appendTimeline(ClusterMonitor.Severity severity, String message) {
+        if (!Platform.isFxApplicationThread()) {
+            Platform.runLater(() -> appendTimeline(severity, message));
+            return;
+        }
+        String time = LocalTime.now().format(CLOCK);
+        timeline.add(0, new TimelineEntry(time, severity, message));
+        while (timeline.size() > 250) {
+            timeline.remove(timeline.size() - 1);
+        }
+        lastEventValue.setText(time);
+        lastEventDetail.setText(message);
+        appendLog(severity + ": " + message);
+    }
+
+    private void showError(String message) {
+        appendLog("ERROR: " + message);
+        Alert alert = new Alert(Alert.AlertType.ERROR, message, ButtonType.OK);
+        alert.setTitle("Error");
+        alert.setHeaderText(null);
+        if (inputArea.getScene() != null
+                && inputArea.getScene().getWindow() instanceof Stage stage) {
+            alert.initOwner(stage);
+        }
+        alert.showAndWait();
+    }
+
+    private static <T> TableColumn<T, String> textColumn(String title,
+            Function<T, ObservableValue<String>> getter, double minWidth) {
+        TableColumn<T, String> column = new TableColumn<>(title);
+        column.setCellValueFactory(data -> getter.apply(data.getValue()));
+        column.setMinWidth(minWidth);
+        return column;
+    }
+
+    private static String joinIds(List<Integer> workerIds) {
+        if (workerIds == null || workerIds.isEmpty()) {
+            return "-";
+        }
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < workerIds.size(); i++) {
+            if (i > 0) {
+                builder.append(",");
+            }
+            builder.append(workerIds.get(i));
+        }
+        return builder.toString();
+    }
+
+    private static String shortTaskId(String taskId) {
+        return taskId != null && taskId.length() > 8 ? taskId.substring(0, 8) : String.valueOf(taskId);
+    }
+
+    // ------------------------------------------------------------ inner types
+
+    /** Mutable per-job runtime state fed by the streaming SubmitJob updates. */
+    private static final class TaskState {
+        String taskId;
+        int percent;
+        int coordinatorId = WorkerNode.NO_COORDINATOR;
+        List<WorkerRow> workers = new ArrayList<>();
+        List<Integer> usedWorkers = new ArrayList<>();
+        int attempt;
+    }
+
+    /** One row of the task table (observable properties keep the table live). */
+    private static final class TaskRow {
+        final int jobId;
+        final StringProperty id = new SimpleStringProperty();
+        final StringProperty type = new SimpleStringProperty();
+        final StringProperty submitted = new SimpleStringProperty();
+        final StringProperty status = new SimpleStringProperty();
+        final StringProperty coordinator = new SimpleStringProperty();
+        final StringProperty workers = new SimpleStringProperty();
+        final StringProperty result = new SimpleStringProperty();
+        final StringProperty error = new SimpleStringProperty();
+
+        TaskRow(int jobId, String type, String submitted) {
+            this.jobId = jobId;
+            this.id.set(String.valueOf(jobId));
+            this.type.set(type);
+            this.submitted.set(submitted);
+            this.status.set("-");
+            this.coordinator.set("-");
+            this.workers.set("-");
+            this.result.set("-");
+            this.error.set("");
+        }
+    }
+
+    /** One row of the worker-level progress drill-down. */
+    private static final class WorkerRow {
+        final StringProperty workerId = new SimpleStringProperty();
+        final StringProperty assigned = new SimpleStringProperty();
+        final StringProperty completed = new SimpleStringProperty();
+        final StringProperty jac = new SimpleStringProperty();
+        final StringProperty online = new SimpleStringProperty();
+        final StringProperty status = new SimpleStringProperty();
+
+        WorkerRow(int workerId, int assigned, int completed, int jac,
+                  boolean online, String status) {
+            this.workerId.set(String.valueOf(workerId));
+            this.assigned.set(String.valueOf(assigned));
+            this.completed.set(String.valueOf(completed));
+            this.jac.set(String.valueOf(jac));
+            this.online.set(online ? "ONLINE" : "DOWN");
+            this.status.set(status == null ? "-" : status);
+        }
+    }
+
+    /** One timestamped entry of the event timeline. */
+    private record TimelineEntry(String time, ClusterMonitor.Severity severity, String message) {
+        @Override
+        public String toString() {
+            return time + "  " + severity + "  " + message;
         }
     }
 }

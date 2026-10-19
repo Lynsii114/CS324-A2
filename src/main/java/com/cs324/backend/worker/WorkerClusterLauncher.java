@@ -1,30 +1,34 @@
 package com.cs324.backend.worker;
 
-import com.cs324.backend.api.WorkerService;
 import com.cs324.backend.bootstrap.BootstrapServer;
+import com.cs324.backend.grpc.GrpcChannels;
+import com.cs324.proto.BootstrapServiceGrpc;
+import com.cs324.proto.Empty;
+import io.grpc.Deadline;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 /**
- * Launches the six configured Worker Nodes (IDs 1-6) as six independent JVM
- * processes. Each process gets its own RMI registry port, its own log file and
- * its own pid file, so the workers stay fully isolated while still talking to
- * each other (and to the Bootstrap Node) through Java RMI.
+ * Launches {@code WorkerClusterConfig.WORKER_COUNT} worker nodes (default 6,
+ * minimum 6) as independent JVM processes. Each process gets its own gRPC
+ * port, its own log file and its own pid file, so the workers stay fully
+ * isolated while still talking to each other (and to the Bootstrap Node) over
+ * gRPC.
  *
  * Usage:
- *   WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort]
+ *   WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort] [workerCount]
  */
 public final class WorkerClusterLauncher {
 
@@ -36,6 +40,11 @@ public final class WorkerClusterLauncher {
 
     public static void main(String[] args) throws Exception {
         String command = args.length > 0 ? args[0] : "start";
+        // Apply an optional worker count BEFORE WorkerClusterConfig is first
+        // loaded, so this JVM and every spawned worker agree on the cluster size.
+        if (args.length > 3 && "start".equals(command)) {
+            System.setProperty(WorkerClusterConfig.WORKER_COUNT_PROPERTY, args[3]);
+        }
         String bootstrapHost = args.length > 1 ? args[1] : WorkerClusterConfig.DEFAULT_HOST;
         int bootstrapPort = args.length > 2 ? Integer.parseInt(args[2]) : BootstrapServer.DEFAULT_PORT;
 
@@ -45,13 +54,14 @@ public final class WorkerClusterLauncher {
             case "status" -> status();
             default -> {
                 System.err.println("Unknown command: " + command);
-                System.err.println("Usage: WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort]");
+                System.err.println("Usage: WorkerClusterLauncher [start|stop|status] [bootstrapHost] [bootstrapPort] [workerCount]");
                 System.exit(1);
             }
         }
     }
 
     public static List<Integer> start(String bootstrapHost, int bootstrapPort) throws Exception {
+        warnOnSizeMismatch(bootstrapHost, bootstrapPort);
         Path logDir = Paths.get(WorkerClusterConfig.LOG_DIR);
         Files.createDirectories(logDir);
 
@@ -72,10 +82,10 @@ public final class WorkerClusterLauncher {
             }
 
             int port = WorkerClusterConfig.portFor(workerId);
-            if (isReachableOverRmi(workerId, bootstrapHost)) {
+            if (isReachableOverGrpc(workerId, bootstrapHost)) {
                 // A worker is already serving this port, but the pid file is stale or was
                 // never written (e.g. launched manually, or left over from a previous
-                // Server Manager session). Do not spawn a duplicate; reclaim its tracking
+                // session). Do not spawn a duplicate; reclaim its tracking
                 // so Start/Stop stay consistent.
                 alreadyRunning.add(workerId);
                 List<Long> orphans = findRunningPids(workerId, port);
@@ -93,6 +103,7 @@ public final class WorkerClusterLauncher {
 
             ProcessBuilder builder = new ProcessBuilder(
                     javaBin,
+                    "-D" + WorkerClusterConfig.WORKER_COUNT_PROPERTY + "=" + WorkerClusterConfig.WORKER_COUNT,
                     "-cp", classpath,
                     WorkerServer.class.getName(),
                     String.valueOf(workerId),
@@ -108,11 +119,11 @@ public final class WorkerClusterLauncher {
             Files.writeString(pidFile, String.valueOf(process.pid()), StandardCharsets.UTF_8);
             started.add(workerId);
             System.out.println("Started Worker " + workerId + " (pid " + process.pid()
-                    + ", rmi port " + port + ", log " + logDir.resolve(logFileName(workerId)) + ")");
+                    + ", gRPC port " + port + ", log " + logDir.resolve(logFileName(workerId)) + ")");
         }
 
         if (!started.isEmpty()) {
-            verifyOverRmi(started, WorkerClusterConfig.DEFAULT_HOST);
+            verifyOverGrpc(started, WorkerClusterConfig.DEFAULT_HOST);
         }
 
         System.out.println();
@@ -122,21 +133,37 @@ public final class WorkerClusterLauncher {
         return started;
     }
 
-    /** Polls each worker's own RMI registry until the worker is reachable. */
-    private static void verifyOverRmi(List<Integer> workerIds, String host) {
+    /** Warns when the bootstrap advertises a different cluster size than this launcher JVM. */
+    private static void warnOnSizeMismatch(String bootstrapHost, int bootstrapPort) {
+        try {
+            BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap =
+                    GrpcChannels.bootstrap(bootstrapHost, bootstrapPort);
+            int expected = bootstrap.getClusterSize(Empty.getDefaultInstance()).getSize();
+            if (expected != WorkerClusterConfig.WORKER_COUNT) {
+                System.err.println("WARNING: Bootstrap Node is configured for " + expected
+                        + " worker node(s) but this launcher is configured for "
+                        + WorkerClusterConfig.WORKER_COUNT
+                        + ". Launch via 'BootstrapServer [port] [workerCount]' or pass a matching "
+                        + "workerCount so the whole cluster agrees.");
+            }
+        } catch (Exception e) {
+            // Bootstrap not reachable yet - let the normal startup report that.
+            System.err.println("Bootstrap Node not reachable at " + bootstrapHost + ":" + bootstrapPort
+                    + " - start it first with 'java -cp target/classes:$(cat target/classpath.txt) "
+                    + "com.cs324.backend.bootstrap.BootstrapServer [port] [workerCount]");
+        }
+    }
+
+    /**
+     * Polls each worker's own gRPC port until the worker answers GetWorkerState
+     * with its own id.
+     */
+    private static void verifyOverGrpc(List<Integer> workerIds, String host) {
         long deadline = System.currentTimeMillis() + LOOKUP_TIMEOUT_MS;
         List<Integer> pending = new ArrayList<>(workerIds);
 
         while (!pending.isEmpty() && System.currentTimeMillis() < deadline) {
-            pending.removeIf(workerId -> {
-                try {
-                    Registry registry = LocateRegistry.getRegistry(host, WorkerClusterConfig.portFor(workerId));
-                    WorkerService worker = (WorkerService) registry.lookup(WorkerClusterConfig.serviceNameFor(workerId));
-                    return worker.getWorkerId() == workerId;
-                } catch (Exception e) {
-                    return false;
-                }
-            });
+            pending.removeIf(workerId -> workerAnswers(workerId, host));
             if (!pending.isEmpty()) {
                 try {
                     Thread.sleep(LOOKUP_POLL_MS);
@@ -149,12 +176,11 @@ public final class WorkerClusterLauncher {
 
         for (Integer workerId : workerIds) {
             if (pending.contains(workerId)) {
-                System.err.println("Worker " + workerId + " did not answer its RMI lookup within "
+                System.err.println("Worker " + workerId + " did not answer its gRPC lookup within "
                         + LOOKUP_TIMEOUT_MS + " ms - check its log file");
             } else {
-                System.out.println("Verified over RMI: worker " + workerId
-                        + " at rmi://" + host + ":" + WorkerClusterConfig.portFor(workerId)
-                        + "/" + WorkerClusterConfig.serviceNameFor(workerId));
+                System.out.println("Verified over gRPC: worker " + workerId
+                        + " at " + host + ":" + WorkerClusterConfig.portFor(workerId));
             }
         }
     }
@@ -218,7 +244,7 @@ public final class WorkerClusterLauncher {
     /**
      * True when this worker's pid file exists and the recorded process is still
      * alive - i.e. the worker was launched (and is being tracked) by this
-     * Server Manager / launcher.
+     * launcher.
      */
     public static boolean isManagedAndAlive(int workerId) {
         Path pidFile = Paths.get(WorkerClusterConfig.LOG_DIR, pidFileName(workerId));
@@ -226,12 +252,18 @@ public final class WorkerClusterLauncher {
         return pid != null && isAlive(pid);
     }
 
-    /** Lightweight check that a worker currently answers its RMI registry with its own id. */
-    private static boolean isReachableOverRmi(int workerId, String host) {
+    /** Lightweight check that a worker currently answers its gRPC server with its own id. */
+    private static boolean isReachableOverGrpc(int workerId, String host) {
+        return workerAnswers(workerId, host);
+    }
+
+    private static boolean workerAnswers(int workerId, String host) {
         try {
-            Registry registry = LocateRegistry.getRegistry(host, WorkerClusterConfig.portFor(workerId));
-            WorkerService worker = (WorkerService) registry.lookup(WorkerClusterConfig.serviceNameFor(workerId));
-            return worker.getWorkerId() == workerId;
+            int got = GrpcChannels.cluster(host, WorkerClusterConfig.portFor(workerId))
+                    .withDeadline(Deadline.after(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                            TimeUnit.MILLISECONDS))
+                    .getWorkerState(Empty.getDefaultInstance()).getWorkerId();
+            return got == workerId;
         } catch (Exception e) {
             return false;
         }
@@ -241,7 +273,7 @@ public final class WorkerClusterLauncher {
      * Finds every live JVM running our WorkerServer command line for <i>workerId</i>
      * on <i>port</i>, regardless of whether a pid file tracks it. This is what lets
      * Start avoid duplicates and Stop reclaim orphaned workers that a previous
-     * Server Manager session left behind.
+     * session left behind.
      */
     private static List<Long> findRunningPids(int workerId, int port) {
         Pattern pattern = Pattern.compile(
@@ -278,17 +310,33 @@ public final class WorkerClusterLauncher {
     }
 
     /**
-     * Resolves the classpath of the running project. Works both under
-     * {@code mvn exec:java} (isolated classloader) and under a plain
-     * {@code java -cp target/classes} launch.
+     * Resolves the classpath a spawned worker needs. The classes directory is
+     * taken from this launcher's own code source (works under plain
+     * {@code java -cp target/classes} and under {@code mvn exec:java}); the
+     * gRPC/protobuf dependency jars come from {@code target/classpath.txt},
+     * generated by the maven-dependency-plugin at {@code process-classes}.
      */
     private static String currentClasspath() {
+        String classesDir;
         try {
             URI uri = WorkerClusterLauncher.class.getProtectionDomain().getCodeSource().getLocation().toURI();
-            return Paths.get(uri).toAbsolutePath().toString();
+            classesDir = Paths.get(uri).toAbsolutePath().toString();
         } catch (Exception e) {
-            return System.getProperty("java.class.path");
+            classesDir = System.getProperty("java.class.path", "");
         }
+
+        Path classpathFile = Paths.get("target", "classpath.txt");
+        if (Files.exists(classpathFile)) {
+            try {
+                String deps = Files.readString(classpathFile, StandardCharsets.UTF_8).trim();
+                if (!deps.isEmpty()) {
+                    return classesDir + File.pathSeparator + deps;
+                }
+            } catch (IOException ignored) {
+                // fall back to classes only
+            }
+        }
+        return classesDir;
     }
 
     private static String logFileName(int workerId) {

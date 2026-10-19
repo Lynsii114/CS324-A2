@@ -1,13 +1,27 @@
 package com.cs324.backend.bootstrap;
 
-import com.cs324.backend.api.BootstrapService;
-import com.cs324.backend.api.WorkerInfo;
+import com.cs324.backend.grpc.GrpcChannels;
 import com.cs324.backend.worker.WorkerClusterConfig;
+import com.cs324.proto.ActiveTasksResponse;
+import com.cs324.proto.ActiveWorkersResponse;
+import com.cs324.proto.BootstrapServiceGrpc;
+import com.cs324.proto.ClusterCompleteTimeResponse;
+import com.cs324.proto.ClusterSizeResponse;
+import com.cs324.proto.Empty;
+import com.cs324.proto.LotteryClaimResponse;
+import com.cs324.proto.PriorityTableResponse;
+import com.cs324.proto.SegmentRecord;
+import com.cs324.proto.SegmentUpdate;
+import com.cs324.proto.TaskLedgerEntry;
+import com.cs324.proto.TaskQuery;
+import com.cs324.proto.TaskStatus;
+import com.cs324.proto.WorkerIdRequest;
+import com.cs324.proto.WorkerInfo;
+import io.grpc.Status;
+import io.grpc.stub.StreamObserver;
 
-import java.rmi.RemoteException;
-import java.rmi.server.UnicastRemoteObject;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -15,100 +29,256 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Thread-safe implementation of the Bootstrap Node. Keeps membership only and
- * sequences the startup lottery claims (first claim -> priority 6); no leader
- * election or job dispatch logic lives here by design.
+ * gRPC implementation of the Bootstrap Node. It only tracks membership,
+ * sequences the startup lottery claims (first claim -> priority N), maintains a
+ * heartbeat watchdog over the workers and hosts the replicated task ledger used
+ * for coordinator state reconstruction. It never takes part in leader election
+ * or job processing.
  */
-public class BootstrapServiceImpl extends UnicastRemoteObject implements BootstrapService {
-    private static final long serialVersionUID = 1L;
+public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceImplBase {
 
-    // ConcurrentHashMap gives us thread-safe register/unregister/read without external locking.
     private final Map<Integer, WorkerInfo> activeWorkers = new ConcurrentHashMap<>();
-
-    /** workerId -> startup priority id (6..1 by lottery claim order). */
+    private final Map<Integer, Long> lastSeenAt = new ConcurrentHashMap<>();
     private final Map<Integer, Integer> priorityTable = new LinkedHashMap<>();
+    private final Map<String, TaskLedgerEntry> taskLedger = new ConcurrentHashMap<>();
 
-    /** Set when all WORKER_COUNT workers have registered; shared lottery reference. */
     private volatile long clusterCompleteAt = 0L;
 
-    public BootstrapServiceImpl() throws RemoteException {
-        super();
+    @Override
+    public void registerWorker(WorkerInfo request, StreamObserver<Empty> responseObserver) {
+        if (request == null || request.getWorkerId() < 1) {
+            responseObserver.onError(Status.INVALID_ARGUMENT
+                    .withDescription("worker info must carry a positive worker id").asException());
+            return;
+        }
+        synchronized (this) {
+            activeWorkers.put(request.getWorkerId(), request);
+            lastSeenAt.put(request.getWorkerId(), System.currentTimeMillis());
+            if (clusterCompleteAt == 0L && activeWorkers.size() >= WorkerClusterConfig.WORKER_COUNT) {
+                clusterCompleteAt = System.currentTimeMillis();
+                System.out.println("[Bootstrap] Cluster complete: " + WorkerClusterConfig.WORKER_COUNT
+                        + "/" + WorkerClusterConfig.WORKER_COUNT + " workers registered");
+            }
+        }
+        System.out.println("[Bootstrap] Registered worker: " + describe(request));
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public synchronized void registerWorker(WorkerInfo worker) throws RemoteException {
-        if (worker == null) {
-            throw new IllegalArgumentException("worker must not be null");
-        }
-        activeWorkers.put(worker.getWorkerId(), worker);
-        System.out.println("[Bootstrap] Registered worker: " + worker);
-        if (clusterCompleteAt == 0L && activeWorkers.size() == WorkerClusterConfig.WORKER_COUNT) {
-            clusterCompleteAt = System.currentTimeMillis();
-            System.out.println("[Bootstrap] Cluster complete: " + WorkerClusterConfig.WORKER_COUNT
-                    + "/" + WorkerClusterConfig.WORKER_COUNT + " workers registered");
-        }
-    }
-
-    @Override
-    public synchronized void unregisterWorker(int workerId) throws RemoteException {
+    public void unregisterWorker(WorkerIdRequest request, StreamObserver<Empty> responseObserver) {
+        int workerId = request.getWorkerId();
         WorkerInfo removed = activeWorkers.remove(workerId);
+        lastSeenAt.remove(workerId);
         if (removed != null) {
-            System.out.println("[Bootstrap] Unregistered worker: " + removed);
+            System.out.println("[Bootstrap] Unregistered worker: " + describe(removed));
         } else {
             System.out.println("[Bootstrap] Unregister requested for unknown worker id: " + workerId);
         }
-        if (activeWorkers.isEmpty()) {
-            // Full wipe -> the next cold start performs a fresh lottery.
-            priorityTable.clear();
-            clusterCompleteAt = 0L;
-            System.out.println("[Bootstrap] Cluster empty - lottery state reset");
+        synchronized (this) {
+            if (activeWorkers.isEmpty()) {
+                priorityTable.clear();
+                clusterCompleteAt = 0L;
+                System.out.println("[Bootstrap] Cluster empty - lottery state reset");
+            }
         }
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public List<WorkerInfo> getActiveWorkers() throws RemoteException {
-        return new ArrayList<>(activeWorkers.values());
+    public void heartbeat(WorkerIdRequest request, StreamObserver<Empty> responseObserver) {
+        lastSeenAt.put(request.getWorkerId(), System.currentTimeMillis());
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public WorkerInfo getRandomWorker() throws RemoteException {
+    public void getActiveWorkers(Empty request, StreamObserver<ActiveWorkersResponse> responseObserver) {
+        List<WorkerInfo> sorted = new ArrayList<>(activeWorkers.values());
+        sorted.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
+        responseObserver.onNext(ActiveWorkersResponse.newBuilder().addAllWorkers(sorted).build());
+        responseObserver.onCompleted();
+    }
+
+    /** Latest snapshot of a single worker, incl. its live heartbeat flag. */
+    public WorkerInfo workerInfoOr(int workerId, WorkerInfo fallback) {
+        WorkerInfo info = activeWorkers.get(workerId);
+        if (info == null) {
+            return fallback;
+        }
+        return withOnline(info);
+    }
+
+    @Override
+    public void getRandomWorker(Empty request, StreamObserver<WorkerInfo> responseObserver) {
         List<WorkerInfo> workers = new ArrayList<>(activeWorkers.values());
         if (workers.isEmpty()) {
-            return null;
+            responseObserver.onNext(WorkerInfo.getDefaultInstance());
+            responseObserver.onCompleted();
+            return;
         }
-        int index = ThreadLocalRandom.current().nextInt(workers.size());
-        return workers.get(index);
+        WorkerInfo picked = workers.get(ThreadLocalRandom.current().nextInt(workers.size()));
+        responseObserver.onNext(withOnline(picked));
+        responseObserver.onCompleted();
     }
 
     @Override
-    public synchronized int lotteryClaim(int workerId) throws RemoteException {
-        Integer existing = priorityTable.get(workerId);
-        if (existing != null) {
-            return existing;
+    public void lotteryClaim(WorkerIdRequest request, StreamObserver<LotteryClaimResponse> responseObserver) {
+        int workerId = request.getWorkerId();
+        int priority;
+        synchronized (this) {
+            Integer existing = priorityTable.get(workerId);
+            if (existing != null) {
+                priority = existing;
+            } else if (priorityTable.size() >= WorkerClusterConfig.WORKER_COUNT) {
+                priority = -1;
+            } else {
+                priority = WorkerClusterConfig.WORKER_COUNT - priorityTable.size(); // N, N-1, ..., 1
+                priorityTable.put(workerId, priority);
+                System.out.println("[Bootstrap] Lottery claim by worker " + workerId
+                        + " -> startup priority " + priority
+                        + " (claims so far: " + priorityTable.size() + "/" + WorkerClusterConfig.WORKER_COUNT + ")");
+            }
         }
-        if (priorityTable.size() >= WorkerClusterConfig.WORKER_COUNT) {
-            return -1;
+        responseObserver.onNext(LotteryClaimResponse.newBuilder().setPriority(priority).build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getWorkerPriority(WorkerIdRequest request, StreamObserver<LotteryClaimResponse> responseObserver) {
+        int priority = priorityTable.getOrDefault(request.getWorkerId(), 0);
+        responseObserver.onNext(LotteryClaimResponse.newBuilder().setPriority(priority).build());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getPriorityTable(Empty request, StreamObserver<PriorityTableResponse> responseObserver) {
+        PriorityTableResponse.Builder builder = PriorityTableResponse.newBuilder();
+        synchronized (this) {
+            builder.putAllPriorities(priorityTable);
         }
-        int priority = WorkerClusterConfig.WORKER_COUNT - priorityTable.size(); // 6, 5, ..., 1
-        priorityTable.put(workerId, priority);
-        System.out.println("[Bootstrap] Lottery claim by worker " + workerId
-                + " -> startup priority " + priority
-                + " (claims so far: " + priorityTable.size() + "/" + WorkerClusterConfig.WORKER_COUNT + ")");
-        return priority;
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public int getWorkerPriority(int workerId) throws RemoteException {
-        return priorityTable.getOrDefault(workerId, 0);
+    public void getClusterCompleteTime(Empty request, StreamObserver<ClusterCompleteTimeResponse> responseObserver) {
+        responseObserver.onNext(ClusterCompleteTimeResponse.newBuilder().setEpochMillis(clusterCompleteAt).build());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public synchronized Map<Integer, Integer> getPriorityTable() throws RemoteException {
-        return new HashMap<>(priorityTable);
+    public void getClusterSize(Empty request, StreamObserver<ClusterSizeResponse> responseObserver) {
+        responseObserver.onNext(ClusterSizeResponse.newBuilder().setSize(WorkerClusterConfig.WORKER_COUNT).build());
+        responseObserver.onCompleted();
+    }
+
+    // ------------------------------------------------------------------ ledger
+
+    @Override
+    public void recordTaskStart(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
+        if (request.getTaskId().isBlank()) {
+            responseObserver.onError(Status.INVALID_ARGUMENT.withDescription("task id must not be blank").asException());
+            return;
+        }
+        taskLedger.put(request.getTaskId(), request);
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
     }
 
     @Override
-    public long getClusterCompleteTime() throws RemoteException {
-        return clusterCompleteAt;
+    public void recordSegmentUpdate(SegmentUpdate request, StreamObserver<Empty> responseObserver) {
+        synchronized (this) {
+            TaskLedgerEntry existing = taskLedger.get(request.getTaskId());
+            if (existing == null) {
+                responseObserver.onNext(Empty.getDefaultInstance());
+                responseObserver.onCompleted();
+                return;
+            }
+            SegmentRecord record = SegmentRecord.newBuilder()
+                    .setSegmentIndex(request.getSegmentIndex())
+                    .setWorkerId(request.getWorkerId())
+                    .setCompleted(request.getCompleted())
+                    .setPartial(request.getPartial())
+                    .setFailed(request.getFailed())
+                    .build();
+            TaskLedgerEntry updated = existing.toBuilder().putSegments(request.getSegmentIndex(), record).build();
+            taskLedger.put(updated.getTaskId(), updated);
+        }
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void recordTaskCompletion(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
+        taskLedger.put(request.getTaskId(), request.toBuilder().setStatus(TaskStatus.TASK_DONE).build());
+        System.out.println("[Bootstrap] Ledger: task " + shortId(request.getTaskId()) + " DONE (client "
+                + request.getClientId() + ", result=" + request.getFinalResult() + ")");
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void recordTaskFailure(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
+        taskLedger.put(request.getTaskId(), request.toBuilder().setStatus(TaskStatus.TASK_FAILED).build());
+        responseObserver.onNext(Empty.getDefaultInstance());
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void getTaskLedger(TaskQuery request, StreamObserver<TaskLedgerEntry> responseObserver) {
+        TaskLedgerEntry entry = taskLedger.get(request.getTaskId());
+        responseObserver.onNext(entry == null ? TaskLedgerEntry.getDefaultInstance() : entry);
+        responseObserver.onCompleted();
+    }
+
+    @Override
+    public void listActiveTasks(Empty request, StreamObserver<ActiveTasksResponse> responseObserver) {
+        ActiveTasksResponse.Builder builder = ActiveTasksResponse.newBuilder();
+        for (TaskLedgerEntry entry : taskLedger.values()) {
+            if (entry.getStatus() == TaskStatus.TASK_RUNNING
+                    || entry.getStatus() == TaskStatus.TASK_RESUMED) {
+                builder.addEntries(entry);
+            }
+        }
+        responseObserver.onNext(builder.build());
+        responseObserver.onCompleted();
+    }
+
+    /** True when the worker's last heartbeat is within the freshness window. */
+    public boolean isOnline(int workerId) {
+        Long last = lastSeenAt.get(workerId);
+        if (last == null) {
+            return false;
+        }
+        return System.currentTimeMillis() - last < WorkerClusterConfig.HEARTBEAT_TIMEOUT_MS;
+    }
+
+    public List<WorkerInfo> onlineWorkers() {
+        List<WorkerInfo> result = new ArrayList<>();
+        for (WorkerInfo worker : activeWorkers.values()) {
+            result.add(withOnline(worker));
+        }
+        result.sort(Comparator.comparingInt(WorkerInfo::getWorkerId));
+        return result;
+    }
+
+    private WorkerInfo withOnline(WorkerInfo info) {
+        return info.toBuilder().setOnline(isOnline(info.getWorkerId())).build();
+    }
+
+    private static String describe(WorkerInfo info) {
+        return "WorkerInfo{workerId=" + info.getWorkerId() + ", host='" + info.getHost()
+                + "', port=" + info.getPort() + "}";
+    }
+
+    private static String shortId(String taskId) {
+        return taskId != null && taskId.length() > 8 ? taskId.substring(0, 8) : taskId;
+    }
+
+    /** Close all cached client channels when the bootstrap process exits. */
+    public static void shutdown() {
+        GrpcChannels.shutdownAll();
     }
 }

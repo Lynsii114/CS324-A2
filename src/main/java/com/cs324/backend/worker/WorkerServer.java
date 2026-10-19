@@ -1,22 +1,25 @@
 package com.cs324.backend.worker;
 
-import com.cs324.backend.api.BootstrapService;
-import com.cs324.backend.api.WorkerInfo;
 import com.cs324.backend.bootstrap.BootstrapServer;
-
-import java.rmi.registry.LocateRegistry;
-import java.rmi.registry.Registry;
-import java.rmi.server.ExportException;
+import com.cs324.backend.grpc.GrpcChannels;
+import com.cs324.proto.BootstrapServiceGrpc;
+import com.cs324.proto.WorkerIdRequest;
+import com.cs324.proto.WorkerInfo;
+import io.grpc.Server;
+import io.grpc.ServerBuilder;
 
 /**
- * Entry point that runs a Worker Node as its own JVM process.
+ * Entry point that runs a Worker Node as its own JVM process. Each worker
+ * hosts its own gRPC server on a dedicated port ({@link
+ * WorkerClusterConfig#portFor(int)}) serving both its {@code ClusterService}
+ * and {@code ClientService}; it registers with the Bootstrap Node, then the
+ * startup lottery and leader election run automatically (no GUI needed).
  */
 public class WorkerServer {
 
-    public static final String SERVICE_NAME_PREFIX = "WorkerService-";
     public static final String DEFAULT_HOST = "localhost";
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         if (args.length < 2) {
             System.err.println("Usage: WorkerServer <workerId> <workerPort> [bootstrapHost] [bootstrapPort] [workerHost]");
             System.exit(1);
@@ -27,56 +30,44 @@ public class WorkerServer {
         String bootstrapHost = args.length > 2 ? args[2] : DEFAULT_HOST;
         int bootstrapPort = args.length > 3 ? Integer.parseInt(args[3]) : BootstrapServer.DEFAULT_PORT;
         String workerHost = args.length > 4 ? args[4] : DEFAULT_HOST;
-        String serviceName = SERVICE_NAME_PREFIX + workerId;
 
-        try {
-            Registry workerRegistry = getOrCreateRegistry(workerPort);
-            WorkerInfo self = new WorkerInfo(workerId, workerHost, workerPort);
+        WorkerNode node = new WorkerNode(workerId, workerHost, workerPort, bootstrapHost, bootstrapPort);
 
-            Registry bootstrapRegistry = LocateRegistry.getRegistry(bootstrapHost, bootstrapPort);
-            BootstrapService bootstrap = (BootstrapService) bootstrapRegistry.lookup(BootstrapServer.SERVICE_NAME);
+        Server server = ServerBuilder.forPort(workerPort)
+                .addService(new WorkerClusterService(node))
+                .addService(new WorkerClientService(node))
+                .build();
+        server.start();
 
-            WorkerServiceImpl worker = new WorkerServiceImpl(workerId, self, bootstrap);
-            workerRegistry.rebind(serviceName, worker);
+        BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap =
+                GrpcChannels.bootstrap(bootstrapHost, bootstrapPort);
+        bootstrap.registerWorker(WorkerInfo.newBuilder()
+                .setWorkerId(workerId)
+                .setHost(workerHost)
+                .setPort(workerPort)
+                .setOnline(true)
+                .build());
 
-            bootstrap.registerWorker(self);
-            worker.syncNeighbours();
-            worker.startAutoElectionChecks();
-            worker.startStartupLottery();
+        node.startBackgroundServices();
 
-            Runtime.getRuntime().addShutdownHook(new Thread(() -> unregisterQuietly(bootstrap, workerId)));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try {
+                bootstrap.unregisterWorker(WorkerIdRequest.newBuilder().setWorkerId(workerId).build());
+                System.out.println("Worker Node " + workerId + " unregistered from Bootstrap Node");
+            } catch (Exception e) {
+                System.err.println("Could not unregister worker " + workerId + ": " + e.getMessage());
+            }
+            server.shutdownNow();
+            node.shutdown();
+            GrpcChannels.shutdownAll();
+        }, "worker-shutdown"));
 
-            System.out.println("Worker Node " + workerId + " started on port " + workerPort);
-            System.out.println("Bound as rmi://" + workerHost + ":" + workerPort + "/" + serviceName);
-            System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
-            System.out.println("Initial state: JAC=0, priority=PENDING (startup lottery), coordinatorId="
-                    + worker.getCurrentCoordinatorId()
-                    + " (none), leaderman=" + worker.getLeaderman()
-                    + ", neighbours=" + worker.getNeighbours());
-        } catch (Exception e) {
-            System.err.println("Worker Node failed to start: " + e.getMessage());
-            e.printStackTrace();
-            System.exit(1);
-        }
-    }
+        System.out.println("Worker Node " + workerId + " started on gRPC port " + workerPort
+                + " (ClusterService + ClientService)");
+        System.out.println("Registered with Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort);
+        System.out.println("Initial state: JAC=0, priority=PENDING (startup lottery), coordinatorId="
+                + node.getCurrentCoordinatorId() + " (none), neighbours=" + node.getNeighbours().size());
 
-    private static Registry getOrCreateRegistry(int port) throws Exception {
-        try {
-            Registry registry = LocateRegistry.createRegistry(port);
-            System.out.println("Created worker RMI registry on port " + port);
-            return registry;
-        } catch (ExportException alreadyRunning) {
-            System.out.println("Using existing worker RMI registry on port " + port);
-            return LocateRegistry.getRegistry(port);
-        }
-    }
-
-    private static void unregisterQuietly(BootstrapService bootstrap, int workerId) {
-        try {
-            bootstrap.unregisterWorker(workerId);
-            System.out.println("Worker Node " + workerId + " unregistered from Bootstrap Node");
-        } catch (Exception e) {
-            System.err.println("Could not unregister worker " + workerId + ": " + e.getMessage());
-        }
+        server.awaitTermination();
     }
 }
