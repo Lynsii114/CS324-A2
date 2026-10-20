@@ -2,7 +2,10 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/Distributed System.iml" filepath="$PROJECT_DIR$/Distributed System.iml" />
+      <module fileurl="file://$PROJECT_DIR$/common/common.iml" filepath="$PROJECT_DIR$/common/common.iml" />
+      <module fileurl="file://$PROJECT_DIR$/bootstrap-server/bootstrap-server.iml" filepath="$PROJECT_DIR$/bootstrap-server/bootstrap-server.iml" />
+      <module fileurl="file://$PROJECT_DIR$/worker-node/worker-node.iml" filepath="$PROJECT_DIR$/worker-node/worker-node.iml" />
+      <module fileurl="file://$PROJECT_DIR$/client/client.iml" filepath="$PROJECT_DIR$/client/client.iml" />
     </modules>
   </component>
 </project>
