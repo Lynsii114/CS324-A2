@@ -6,15 +6,11 @@
         <sourceOutputDir name="target/generated-sources/annotations" />
         <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
         <outputRelativeToContentRoot value="true" />
-        <module name="Distributed System" />
-        <module name="distributed-system" />
+        <module name="common" />
+        <module name="bootstrap-server" />
+        <module name="worker-node" />
+        <module name="client" />
       </profile>
     </annotationProcessing>
-    <bytecodeTargetLevel>
-      <module name="bootstrap" target="17" />
-      <module name="client" target="17" />
-      <module name="proto" target="17" />
-      <module name="worker" target="17" />
-    </bytecodeTargetLevel>
   </component>
 </project>

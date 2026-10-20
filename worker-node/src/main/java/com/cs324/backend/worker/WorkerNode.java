@@ -102,6 +102,8 @@ public class WorkerNode {
     private final AtomicInteger currentCoordinatorId = new AtomicInteger(NO_COORDINATOR);
     private final AtomicInteger jobsThisTerm = new AtomicInteger(0);
     private final AtomicBoolean electionInProgress = new AtomicBoolean(false);
+    /** True while this worker is handing a finished term over to a new coordinator. */
+    private final AtomicBoolean handoverInProgress = new AtomicBoolean(false);
     private final AtomicInteger jobThreadCounter = new AtomicInteger(0);
 
     private final Set<String> processedElectionIds = ConcurrentHashMap.newKeySet();
@@ -376,7 +378,17 @@ public class WorkerNode {
      */
     private void coordinatorMonitoredElectionTick() {
         int coord = currentCoordinatorId.get();
-        if (coord != NO_COORDINATOR && coord != workerId) {
+        if (coord == workerId) {
+            // This worker holds the term: if every job slot has been handed out it
+            // must step down and let someone else take over, otherwise a burst of
+            // concurrent client jobs would be rejected with no coordinator to run
+            // them. (Long-lived slots are reclaimed by the liveness check below.)
+            if (termExhausted()) {
+                maybeEndCoordinatorTerm();
+            }
+            return;
+        }
+        if (coord != NO_COORDINATOR) {
             if (coordinatorResponsive(coord)) {
                 return;
             }
@@ -714,6 +726,13 @@ public class WorkerNode {
         System.out.println("[Worker " + workerId + "] received Term_End from coordinator worker "
                 + notification.getPriorCoordinatorId() + " -> final JAC table: "
                 + notification.getFinalJacTableMap());
+        // The prior coordinator has stepped down, so any local view that still
+        // points at it is stale. Clearing it lets the term-end election (or this
+        // worker's own coordinator monitor tick) elect a replacement promptly
+        // instead of re-adopting a coordinator that no longer serves jobs.
+        if (currentCoordinatorId.get() == notification.getPriorCoordinatorId()) {
+            recordCoordinator(NO_COORDINATOR);
+        }
     }
 
     private CandidateInfo candidateSelf() {
@@ -825,6 +844,10 @@ public class WorkerNode {
         try {
             termSlot = claimTermSlot();
         } catch (Exception e) {
+            // No job slots left in this term. Several clients can be submitting at
+            // once, so reject this one cleanly and drive the handover to the next
+            // coordinator; the client retries against the new coordinator.
+            onTermEnd();
             observer.onError(Status.RESOURCE_EXHAUSTED.withDescription(e.getMessage()).asException());
             return;
         }
@@ -1177,6 +1200,7 @@ public class WorkerNode {
                     .setWorkerId(segment.workerId)
                     .setCompleted(true)
                     .setPartial(segment.partial)
+                    .setCoordinatorId(workerId)
                     .build());
         } catch (StatusRuntimeException e) {
             System.err.println("[Worker " + workerId + "] ledger segment update failed: " + e.getStatus().getCode());
@@ -1190,6 +1214,7 @@ public class WorkerNode {
                     .setSegmentIndex(segment.index)
                     .setWorkerId(segment.workerId)
                     .setFailed(true)
+                    .setCoordinatorId(workerId)
                     .build());
         } catch (StatusRuntimeException ignored) {
         }
@@ -1202,6 +1227,7 @@ public class WorkerNode {
                     .setSegmentIndex(segment.index)
                     .setWorkerId(segment.workerId)
                     .setFailed(true)
+                    .setCoordinatorId(workerId)
                     .build());
         } catch (StatusRuntimeException ignored) {
         }
@@ -1270,7 +1296,13 @@ public class WorkerNode {
 
     private TaskLedgerEntry readLedgerEntry(String taskId) {
         try {
-            return bootstrap.getTaskLedger(com.cs324.proto.TaskQuery.newBuilder().setTaskId(taskId).build());
+            // coordinator_id 0 = "any coordinator": a resumed task was started by
+            // whichever coordinator the client was talking to before failover, so
+            // the caller does not know the owner and the lookup must search.
+            return bootstrap.getTaskLedger(com.cs324.proto.TaskQuery.newBuilder()
+                    .setTaskId(taskId)
+                    .setCoordinatorId(0)
+                    .build());
         } catch (StatusRuntimeException e) {
             return TaskLedgerEntry.getDefaultInstance();
         }
@@ -1560,13 +1592,26 @@ public class WorkerNode {
 
     // ------------------------------------------------------------ term lifecycle
 
+    /**
+     * Status description of a rejected submission. Kept as a constant so the
+     * client can recognise the "term is over, retry" condition and fail over
+     * instead of surfacing it as a hard error.
+     */
+    public static final String TERM_ENDED_MESSAGE_PREFIX = "Coordinator term ended";
+
+    /**
+     * Claims one of this term's {@link #COORDINATOR_TERM_LIMIT} job slots for a
+     * submission. Slots are claimed <i>before</i> the job is queued, so with
+     * several clients submitting at once the term serves exactly its limit and
+     * the surplus is rejected rather than silently over-committed.
+     */
     private int claimTermSlot() {
         for (; ; ) {
             int current = jobsThisTerm.get();
             if (current >= COORDINATOR_TERM_LIMIT) {
                 throw new StatusRuntimeException(Status.RESOURCE_EXHAUSTED.withDescription(
-                        "Coordinator term ended after " + COORDINATOR_TERM_LIMIT
-                                + " jobs; no jobs can be processed until the next leader election completes"));
+                        TERM_ENDED_MESSAGE_PREFIX + " after " + COORDINATOR_TERM_LIMIT
+                                + " jobs; retry against the newly elected coordinator"));
             }
             if (jobsThisTerm.compareAndSet(current, current + 1)) {
                 return current + 1;
@@ -1574,36 +1619,78 @@ public class WorkerNode {
         }
     }
 
+    /** True when this worker has handed out every job slot of its current term. */
+    public boolean termExhausted() {
+        return jobsThisTerm.get() >= COORDINATOR_TERM_LIMIT;
+    }
+
+    /**
+     * Called when a submission is rejected; the worker is no longer the
+     * coordinator so it nudges the rest of the cluster to converge on a new one
+     * (idempotent - the election is only started once, and the periodic
+     * coordinator monitor also performs one if nobody else gets there first).
+     */
+    public void onTermEnd() {
+        if (currentCoordinatorId.get() == workerId) {
+            return; // another client's submission already drove the failover
+        }
+        if (termExhausted()) {
+            maybeEndCoordinatorTerm();
+        }
+    }
+
+    /**
+     * Ends this worker's coordinator term once every job slot has been used:
+     * broadcasts the final JAC table, steps down and starts the term-end
+     * election. Called from the job threads as submissions are rejected, from
+     * the completion path, and from {@link #onTermEnd()}.
+     *
+     * <p>It is guarded by a CAS on the coordinator id, so when many clients
+     * finish their jobs at the same instant exactly one of them runs the
+     * handover.</p>
+     */
     private void maybeEndCoordinatorTerm() {
         if (jobsThisTerm.get() < COORDINATOR_TERM_LIMIT) {
             return;
         }
         if (!currentCoordinatorId.compareAndSet(workerId, NO_COORDINATOR)) {
-            return; // another finished job already ended this term
+            return; // another finished job or rejected submission already ended this term
         }
-        System.out.println("[Worker " + workerId + "] completed " + COORDINATOR_TERM_LIMIT
-                + " jobs this term - ending term and starting a new leader election");
-        Map<Integer, Integer> jacTable = broadcastTermEnd();
-
-        int highestNodeJac = Integer.MIN_VALUE;
-        for (Map.Entry<Integer, Integer> e : jacTable.entrySet()) {
-            if (e.getKey() != workerId) {
-                highestNodeJac = Math.max(highestNodeJac, e.getValue());
-            }
+        if (!handoverInProgress.compareAndSet(false, true)) {
+            return;
         }
-        if (highestNodeJac != Integer.MIN_VALUE) {
-            int demotionTarget = highestNodeJac + 1;
-            if (jobAllocationCounter.get() <= highestNodeJac) {
-                jobAllocationCounter.addAndGet(demotionTarget - jobAllocationCounter.get());
-            }
-        }
-        System.out.println("[Worker " + workerId + "] demotion tick -> JAC is now "
-                + jobAllocationCounter.get());
-
         try {
-            initiateElection();
-        } catch (StatusRuntimeException e) {
-            System.err.println("[Worker " + workerId + "] term re-election failed: " + e.getStatus().getCode());
+            // The term is over immediately, so this worker must not "adopt" itself
+            // as coordinator while the handover is in flight (it is still alive,
+            // just no longer serving).
+            recordCoordinator(NO_COORDINATOR);
+            System.out.println("[Worker " + workerId + "] completed " + COORDINATOR_TERM_LIMIT
+                    + " jobs this term - ending term and starting a new leader election");
+            Map<Integer, Integer> jacTable = broadcastTermEnd();
+
+            int highestNodeJac = Integer.MIN_VALUE;
+            for (Map.Entry<Integer, Integer> e : jacTable.entrySet()) {
+                if (e.getKey() != workerId) {
+                    highestNodeJac = Math.max(highestNodeJac, e.getValue());
+                }
+            }
+            if (highestNodeJac != Integer.MIN_VALUE) {
+                int demotionTarget = highestNodeJac + 1;
+                if (jobAllocationCounter.get() <= highestNodeJac) {
+                    jobAllocationCounter.addAndGet(demotionTarget - jobAllocationCounter.get());
+                }
+            }
+            System.out.println("[Worker " + workerId + "] demotion tick -> JAC is now "
+                    + jobAllocationCounter.get());
+
+            try {
+                initiateElection();
+            } catch (StatusRuntimeException e) {
+                System.err.println("[Worker " + workerId + "] term re-election failed: "
+                        + e.getStatus().getCode());
+            }
+        } finally {
+            handoverInProgress.set(false);
         }
     }
 
