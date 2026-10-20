@@ -1,0 +1,43 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cs324</groupId>
+        <artifactId>distributed-system</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>bootstrap-server</artifactId>
+    <packaging>jar</packaging>
+    <name>DistriLab :: Bootstrap Server</name>
+    <description>
+        The Bootstrap Node: a standalone gRPC server (BootstrapService) that tracks
+        membership and heartbeats, runs the startup lottery and keeps the durable
+        task/segment ledger used for coordinator state reconstruction. It spawns
+        nothing - start it in its own terminal, then start the workers.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cs324</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Writes target/classpath.txt for `java -cp "target/classes:$(cat target/classpath.txt)"`. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

@@ -1,6 +1,7 @@
 package com.cs324.backend.worker;
 
-import com.cs324.backend.grpc.GrpcChannels;
+import com.cs324.common.ClusterConfig;
+import com.cs324.common.GrpcChannels;
 import com.cs324.proto.BootstrapServiceGrpc;
 import com.cs324.proto.CandidateInfo;
 import com.cs324.proto.ClusterServiceGrpc;
@@ -325,11 +326,11 @@ public class WorkerNode {
     public void startBackgroundServices() {
         long initialDelay = Math.max(FIRST_WORKER_DELAY_MS, (long) workerId * WORKER_DELAY_STEP_MS);
         electionScheduler.scheduleWithFixedDelay(this::coordinatorMonitoredElectionTick,
-                initialDelay, WorkerClusterConfig.COORDINATOR_MONITOR_PERIOD_MS, TimeUnit.MILLISECONDS);
+                initialDelay, ClusterConfig.COORDINATOR_MONITOR_PERIOD_MS, TimeUnit.MILLISECONDS);
         lotteryScheduler.scheduleWithFixedDelay(this::lotteryTick,
                 LOTTERY_MIN_DELAY_MS, LOTTERY_POLL_MS, TimeUnit.MILLISECONDS);
         heartbeatScheduler.scheduleWithFixedDelay(this::heartbeatTick,
-                WorkerClusterConfig.HEARTBEAT_PERIOD_MS, WorkerClusterConfig.HEARTBEAT_PERIOD_MS,
+                ClusterConfig.HEARTBEAT_PERIOD_MS, ClusterConfig.HEARTBEAT_PERIOD_MS,
                 TimeUnit.MILLISECONDS);
     }
 
@@ -414,7 +415,7 @@ public class WorkerNode {
         try {
             ClusterServiceGrpc.ClusterServiceBlockingStub stub =
                     GrpcChannels.cluster(info.getHost(), info.getPort())
-                            .withDeadlineAfter(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                            .withDeadlineAfter(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                                     TimeUnit.MILLISECONDS);
             WorkerState state = stub.getWorkerState(Empty.getDefaultInstance());
             return state.getWorkerId() == coordWorkerId;
@@ -437,7 +438,7 @@ public class WorkerNode {
             try {
                 ClusterServiceGrpc.ClusterServiceBlockingStub stub =
                         GrpcChannels.cluster(peer.getHost(), peer.getPort())
-                                .withDeadlineAfter(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                                .withDeadlineAfter(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                                         TimeUnit.MILLISECONDS);
                 int reported = stub.getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
                 if (reported != NO_COORDINATOR
@@ -465,7 +466,7 @@ public class WorkerNode {
             if (priorityId == 0) {
                 if (lotteryFireAt == -1L) {
                     long completeTime = readClusterCompleteTime();
-                    boolean fullCluster = readActiveWorkerCount() >= WorkerClusterConfig.WORKER_COUNT;
+                    boolean fullCluster = readActiveWorkerCount() >= ClusterConfig.WORKER_COUNT;
                     if (completeTime > 0 && fullCluster) {
                         lotteryFireAt = completeTime + lotteryCountdown();
                         System.out.println("[Worker " + workerId + "] lottery countdown -> "
@@ -495,7 +496,7 @@ public class WorkerNode {
                         + "(neighbours=" + neighbours.size() + ")");
             }
 
-            if (priorityId == WorkerClusterConfig.WORKER_COUNT
+            if (priorityId == ClusterConfig.WORKER_COUNT
                     && isPriorityTableComplete()
                     && currentCoordinatorId.get() == NO_COORDINATOR) {
                 // The priority-N worker declares itself the initial coordinator. The
@@ -513,7 +514,7 @@ public class WorkerNode {
                 recordCoordinator(workerId);
                 System.out.println("[Worker " + workerId + "] priority " + priorityId
                         + " -> declaring self Initial Coordinator and alerting the other "
-                        + (WorkerClusterConfig.WORKER_COUNT - 1) + " workers");
+                        + (ClusterConfig.WORKER_COUNT - 1) + " workers");
                 for (WorkerInfo other : safeOnlineWorkers()) {
                     if (other.getWorkerId() == workerId) {
                         continue;
@@ -550,7 +551,7 @@ public class WorkerNode {
     private boolean isPriorityTableComplete() {
         try {
             return bootstrap.getPriorityTable(Empty.getDefaultInstance()).getPrioritiesCount()
-                    >= WorkerClusterConfig.WORKER_COUNT;
+                    >= ClusterConfig.WORKER_COUNT;
         } catch (StatusRuntimeException e) {
             return false;
         }
@@ -652,7 +653,7 @@ public class WorkerNode {
                 // A hard deadline bounds each hop so a dead worker does not stall
                 // the whole election (fault tolerance).
                 ProcessedParticipants reply = stub.withDeadline(
-                                Deadline.after(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                                Deadline.after(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                                         TimeUnit.MILLISECONDS))
                         .receiveElection(message);
                 if (reply != null && reply.getParticipantsCount() > 0) {
@@ -888,7 +889,7 @@ public class WorkerNode {
      * Runs every segment of a task, defending against worker failure: each
      * segment call has a deadline; on failure the segment is re-assigned to a
      * fresh reachable worker and retried (up to {@link
-     * WorkerClusterConfig#MAX_SEGMENT_RETRIES}). The task ledger is updated
+     * ClusterConfig#MAX_SEGMENT_RETRIES}). The task ledger is updated
      * after every segment and a progress update is streamed after each success.
      */
     private TaskUpdate runSegmentsWithFaultTolerance(com.cs324.proto.JobRequest request,
@@ -914,7 +915,7 @@ public class WorkerNode {
 
             int attempts = 0;
             boolean done = false;
-            while (!done && attempts <= WorkerClusterConfig.MAX_SEGMENT_RETRIES) {
+            while (!done && attempts <= ClusterConfig.MAX_SEGMENT_RETRIES) {
                 int targetId = segment.workerId;
                 WorkerInfo target = lookupRegisteredWorker(targetId);
                 if (target == null || !online(targetId)) {
@@ -938,7 +939,7 @@ public class WorkerNode {
                 try {
                     ClusterServiceGrpc.ClusterServiceBlockingStub stub =
                             GrpcChannels.cluster(target.getHost(), target.getPort())
-                                    .withDeadlineAfter(WorkerClusterConfig.SEGMENT_CALL_TIMEOUT_MS,
+                                    .withDeadlineAfter(ClusterConfig.SEGMENT_CALL_TIMEOUT_MS,
                                             TimeUnit.MILLISECONDS);
                     long partial = callSegment(stub, jobType, segment);
                     // JAC tracking: the worker that processed this segment has its
@@ -1410,7 +1411,7 @@ public class WorkerNode {
             if (state == null || info == null) {
                 continue;
             }
-            if (lastSeen(id) >= WorkerClusterConfig.HEARTBEAT_TIMEOUT_MS) {
+            if (lastSeen(id) >= ClusterConfig.HEARTBEAT_TIMEOUT_MS) {
                 continue; // bootstrap says the heartbeat is stale
             }
             candidates.add(info);
@@ -1433,7 +1434,7 @@ public class WorkerNode {
         }
         try {
             return GrpcChannels.cluster(worker.getHost(), worker.getPort())
-                    .withDeadline(Deadline.after(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                    .withDeadline(Deadline.after(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                             TimeUnit.MILLISECONDS))
                     .getNeighbours(Empty.getDefaultInstance()).getNeighboursList();
         } catch (StatusRuntimeException e) {
@@ -1451,7 +1452,7 @@ public class WorkerNode {
         }
         try {
             return GrpcChannels.cluster(worker.getHost(), worker.getPort())
-                    .withDeadline(Deadline.after(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                    .withDeadline(Deadline.after(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                             TimeUnit.MILLISECONDS))
                     .getWorkerState(Empty.getDefaultInstance());
         } catch (StatusRuntimeException e) {
@@ -1477,7 +1478,7 @@ public class WorkerNode {
         }
         try {
             GrpcChannels.cluster(info.getHost(), info.getPort())
-                    .withDeadlineAfter(WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
+                    .withDeadlineAfter(ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS,
                             TimeUnit.MILLISECONDS)
                     .getWorkerState(Empty.getDefaultInstance());
             return true;
@@ -1498,7 +1499,7 @@ public class WorkerNode {
         List<WorkerInfo> all = safeActiveWorkers();
         List<WorkerInfo> onlineWorkers = new ArrayList<>();
         for (WorkerInfo w : all) {
-            if (lastSeen(w.getWorkerId()) < WorkerClusterConfig.HEARTBEAT_TIMEOUT_MS) {
+            if (lastSeen(w.getWorkerId()) < ClusterConfig.HEARTBEAT_TIMEOUT_MS) {
                 onlineWorkers.add(w);
             }
         }

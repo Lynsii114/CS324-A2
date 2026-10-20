@@ -53,22 +53,40 @@ The cluster is designed to keep serving jobs while workers die and rejoin:
   linked into a small neighbour ring, and automatically **elect a coordinator**. The coordinator
   serves **at most 5 client jobs** per term, then a re-election rotates to the least-loaded worker.
 - Every gRPC channel is cached per `host:port` and re-used by all components
-  (`com.cs324.backend.grpc.GrpcChannels`), with a 30 s keep-alive.
+  (`com.cs324.common.GrpcChannels`, in the `common` module), with a 30 s keep-alive.
 - The **client GUI** watches the whole system with a background health monitor
   (`ClusterMonitor`) and renders server failure detection, reconnect attempts, recovery and
   coordinator failover live on its dashboard.
 
-Main packages:
+### Project layout (separate projects, gRPC between them)
 
-| Package | Responsibility |
+The system is split into four Maven projects so that the Bootstrap Node, the worker nodes and the
+client are built, started and killed independently — they share **nothing but the gRPC contract**
+(`common/distrilab.proto`):
+
+```
+common/            →  protobuf/gRPC stubs + GrpcChannels + ClusterConfig   (no server/client code)
+bootstrap-server/  →  BootstrapService server        (depends on common)
+worker-node/       →  ClusterService + ClientService servers + launcher (depends on common)
+client/            →  ClientService consumer + health dashboard (depends on common)
+```
+
+No module depends on another deployable: the client never links against `WorkerNode` or
+`BootstrapServer` (it keeps its own `EndpointDefaults`), and a worker never links against the
+bootstrap server (it keeps its own `BootstrapEndpoint`). Everything the three of them need to
+agree on — ports, cluster size, timeouts, message shapes — lives in `common`.
+
+Main packages / Maven projects:
+
+| Module (project) | Responsibility |
 |---------|----------------|
-| `com.cs324.backend.bootstrap` | `BootstrapServer` (terminal entry point — prints per-worker start commands, spawns nothing), `BootstrapServiceImpl` (membership, lottery, task/segment ledger) |
-| `com.cs324.backend.worker` | `WorkerNode` (election, coordinator duties, segment executor, retry logic), `WorkerServer`, `WorkerClusterService`, `WorkerClientService`, `WorkerClusterLauncher` (optional bulk start/stop tool) |
-| `com.cs324.backend.grpc` | `GrpcChannels` (cached `ManagedChannel`s per target, keep-alive policy) |
-| `com.cs324.frontend.client` | `ClientGUI` (JavaFX client + dashboard), `ClusterMonitor` (background health probes driving the dashboard) |
-| `com.cs324.frontend.ui` | `UITheme` (AtlantaFX `PrimerLight` base theme + project stylesheet layer) |
-| `src/main/resources/com/cs324/frontend/ui/client-theme.css` | Project stylesheet: enlarged typography, cards, status pills, event timeline |
-| `src/main/proto/distrilab.proto` | gRPC contracts: `BootstrapService`, `ClusterService`, `ClientService`; messages incl. `SegmentRecord` |
+| `common/` | `distrilab.proto` (gRPC contract: `BootstrapService`, `ClusterService`, `ClientService`; messages incl. `SegmentRecord`), `com.cs324.common.GrpcChannels` (cached `ManagedChannel`s per target, keep-alive policy), `com.cs324.common.ClusterConfig` (ports, cluster size, fault-tolerance timeouts) |
+| `bootstrap-server/` | `com.cs324.backend.bootstrap.BootstrapServer` (terminal entry point — prints per-worker start commands, spawns nothing), `BootstrapServiceImpl` (membership, lottery, task/segment ledger) |
+| `worker-node/` | `com.cs324.backend.worker.WorkerNode` (election, coordinator duties, segment executor, retry logic), `WorkerServer`, `WorkerClusterService`, `WorkerClientService`, `WorkerClusterLauncher` (optional bulk start/stop tool), `BootstrapEndpoint` (the one address a worker needs from the bootstrap) |
+| `client/` | `com.cs324.frontend.client.ClientGUI` (JavaFX client + dashboard), `ClusterMonitor` (background health probes driving the dashboard), `EndpointDefaults`; `com.cs324.frontend.ui.UITheme` (AtlantaFX `PrimerLight` base theme + project stylesheet layer); `src/main/resources/.../client-theme.css` (enlarged typography, cards, status pills, event timeline) |
+
+Dependency direction: `bootstrap-server`, `worker-node` and `client` each depend only on `common`.
+They never link against each other — cross-project communication is entirely gRPC.
 
 ---
 
@@ -89,12 +107,12 @@ All defaults live in the source so nothing needs to be set before the first run:
 |---------|-------|---------|
 | Bootstrap gRPC port | `BootstrapServer.DEFAULT_PORT` | `1099` |
 | Number of workers | `BootstrapServer [port] [count]` (or `-Dcs324.worker.count`) | `6` (minimum `6`) |
-| Worker IDs / ports (`5000 + id`) | `WorkerClusterConfig` | `1..N` → `5001..5000+N` |
+| Worker IDs / ports (`5000 + id`) | `ClusterConfig` (`com.cs324.common`) | `1..N` → `5001..5000+N` |
 | Max jobs per coordinator term | `WorkerNode.COORDINATOR_TERM_LIMIT` | `5` |
-| Segment retries (killed worker) | `WorkerClusterConfig.MAX_SEGMENT_RETRIES` | `3` |
-| Segment call deadline | `WorkerClusterConfig.SEGMENT_CALL_TIMEOUT_MS` | `15 s` |
-| Coordinator liveness probe | `WorkerClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS` | `3 s` |
-| Bootstrap heartbeat period / freshness timeout | `WorkerClusterConfig` | `2 s` / `8 s` |
+| Segment retries (killed worker) | `ClusterConfig.MAX_SEGMENT_RETRIES` | `3` |
+| Segment call deadline | `ClusterConfig.SEGMENT_CALL_TIMEOUT_MS` | `15 s` |
+| Coordinator liveness probe | `ClusterConfig.COORDINATOR_PROBE_TIMEOUT_MS` | `3 s` |
+| Bootstrap heartbeat period / freshness timeout | `ClusterConfig` | `2 s` / `8 s` |
 | Client health probe interval / deadline | `ClusterMonitor.PROBE_INTERVAL_MS` / `PROBE_DEADLINE_MS` | `2 s` / `1.5 s` |
 | PRIMESUM range length per segment | `WorkerNode.SEGMENT_RANGE_LENGTH` | `200` |
 | MAX / PRIMECOUNT numbers per segment | `WorkerNode.SEGMENT_NUMBERS` | `3` |
@@ -111,20 +129,37 @@ Fixed port layout (do not run other services on these):
 
 ## Building the Project
 
-```bash
-mvn clean compile            # compiles + regenerates the gRPC stubs from src/main/proto
-mvn process-classes          # also writes target/classpath.txt (needed to run the cluster)
+The repository is a **multi-module Maven build** — every part of the cluster is its own project
+and they only talk to each other over gRPC:
+
+```
+distributed-system (parent pom)
+├── common             shared gRPC contract: distrilab.proto + generated stubs,
+│                      GrpcChannels, ClusterConfig   (no main class)
+├── bootstrap-server   the Bootstrap Node  (BootstrapService)
+├── worker-node        a worker node       (ClusterService + ClientService + launcher)
+└── client             the JavaFX client   (ClientService consumer + health dashboard)
 ```
 
-The cluster needs the gRPC/JavaFX jars on the classpath, so **always launch with**:
+`bootstrap-server`, `worker-node` and `client` each depend **only** on `common` (the gRPC
+contract); none of them depends on another deployable, so any of the three can be built, started,
+killed or replaced on its own.
 
 ```bash
-java -cp "target/classes:$(cat target/classpath.txt)" <class>
+mvn clean install            # builds all four modules in order, regenerating the gRPC stubs
+mvn -pl worker-node install  # or build a single module (with -am to include its dependencies)
+```
+
+Each runtime module writes its own `target/classpath.txt` at `process-classes`, so **launch from
+inside that module's directory** with:
+
+```bash
+cd <module> && java -cp "target/classes:$(cat target/classpath.txt)" <class>
 ```
 
 > **Non-Linux hosts:** the JavaFX jars are pulled with the `javafx.platform` classifier
 > (default `linux`). Override it when building elsewhere, e.g.
-> `mvn clean compile -Djavafx.platform=win` or `-Djavafx.platform=mac` /
+> `mvn clean install -Djavafx.platform=win` or `-Djavafx.platform=mac` /
 > `-Djavafx.platform=mac-aarch64`.
 
 ---
@@ -134,9 +169,10 @@ java -cp "target/classes:$(cat target/classpath.txt)" <class>
 The Bootstrap Node only **prints** the per-worker start commands — every JVM is started by you,
 in its own terminal, so you can kill/restart any single piece independently.
 
-**Terminal 1 — Bootstrap Node:**
+**Terminal 1 — Bootstrap Node (from `bootstrap-server/`):**
 
 ```bash
+cd bootstrap-server
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.bootstrap.BootstrapServer
 # optional:  BootstrapServer [bootstrapPort] [workerCount]
 ```
@@ -147,14 +183,15 @@ On startup it prints the exact `WorkerServer` command for every worker id, e.g.:
 Bootstrap Node started on gRPC port 1099
 Expecting 6 worker node(s) (minimum 6).
 Start each worker in its own terminal, e.g.:
-  java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 1 5001
-  java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 2 5002
+  (cd worker-node && java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 1 5001)
+  (cd worker-node && java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 2 5002)
   ...
 ```
 
-**Terminals 2…7 — one worker each:**
+**Terminals 2…7 — one worker each (from `worker-node/`):**
 
 ```bash
+cd worker-node
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 1 5001
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 2 5002
 # ... up to WorkerServer 6 5006 (and beyond)
@@ -165,9 +202,10 @@ Optional trailing args: `WorkerServer <workerId> <port> [bootstrapHost] [bootstr
 Once all workers are registered the bootstrap declares the cluster complete and the startup
 lottery runs; within ~10 s the workers elect a coordinator.
 
-**Terminal N — the client GUI:**
+**Terminal N — the client GUI (from `client/`):**
 
 ```bash
+cd client
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.frontend.client.ClientGUI
 # optional:  ClientGUI [bootstrapPort]
 ```
@@ -176,9 +214,12 @@ Click **Connect** — the dashboard starts probing the cluster and resolves the 
 
 ### Optional: bulk launcher (bash convenience, not a GUI)
 
-If you prefer fewer terminals for the workers, `WorkerClusterLauncher` is still available:
+If you prefer fewer terminals for the workers, `WorkerClusterLauncher` (in `worker-node/`) is
+still available; it spawns the worker JVMs and writes `worker-<id>.log` / `worker-<id>.pid` into
+`logs/` under the directory you start it from (by convention the repository root):
 
 ```bash
+cd worker-node
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerClusterLauncher start  localhost 1099 6
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerClusterLauncher status
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerClusterLauncher stop
@@ -189,6 +230,7 @@ java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.W
 Start an **additional** worker against the *running* cluster at any time:
 
 ```bash
+cd worker-node
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.backend.worker.WorkerServer 7 5007 localhost 1099 localhost
 ```
 
@@ -372,7 +414,7 @@ workers `[6, 1, 4, 2, 5, 7]`), and the total stayed correct.
 | `Connection refused` on startup | Start the Bootstrap Node first; check ports (`1099`, `5001..5000+N`). |
 | `Worker N is not the coordinator` | A term just ended (or you targeted a segment worker); submit to the resolved coordinator. |
 | `Coordinator term ended after 5 jobs` | Expected — resubmit; the client auto-resolves the new coordinator. |
-| `ClassNotFoundException: com.cs324.backend.grpc.GrpcChannels` | You ran with `-cp target/classes` only — use `target/classes:$(cat target/classpath.txt)`. |
+| `ClassNotFoundException: com.cs324.common.GrpcChannels` | You ran with `-cp target/classes` only (or from the wrong module) — run from the owning module: `cd <module> && java -cp "target/classes:$(cat target/classpath.txt)" ...`. |
 | `Error: JavaFX runtime components are missing...` | You launched `...ClientApp` (the nested `Application` subclass) directly — launch `com.cs324.frontend.client.ClientGUI` instead; its plain `main` delegates correctly. |
 | Client window does not open | No display available — run it on a desktop session (needs `DISPLAY` on X11). |
 | `Address already in use` on a worker port | A stale worker process owns the port (check `ps`, kill the old pid). |

@@ -1,7 +1,6 @@
 package com.cs324.backend.worker;
 
-import com.cs324.backend.bootstrap.BootstrapServer;
-import com.cs324.backend.grpc.GrpcChannels;
+import com.cs324.common.GrpcChannels;
 import com.cs324.proto.BootstrapServiceGrpc;
 import com.cs324.proto.WorkerIdRequest;
 import com.cs324.proto.WorkerInfo;
@@ -11,7 +10,7 @@ import io.grpc.ServerBuilder;
 /**
  * Entry point that runs a Worker Node as its own JVM process. Each worker
  * hosts its own gRPC server on a dedicated port ({@link
- * WorkerClusterConfig#portFor(int)}) serving both its {@code ClusterService}
+ * ClusterConfig#portFor(int)}) serving both its {@code ClusterService}
  * and {@code ClientService}; it registers with the Bootstrap Node, then the
  * startup lottery and leader election run automatically (no GUI needed).
  */
@@ -28,7 +27,7 @@ public class WorkerServer {
         int workerId = Integer.parseInt(args[0]);
         int workerPort = Integer.parseInt(args[1]);
         String bootstrapHost = args.length > 2 ? args[2] : DEFAULT_HOST;
-        int bootstrapPort = args.length > 3 ? Integer.parseInt(args[3]) : BootstrapServer.DEFAULT_PORT;
+        int bootstrapPort = args.length > 3 ? Integer.parseInt(args[3]) : BootstrapEndpoint.DEFAULT_PORT;
         String workerHost = args.length > 4 ? args[4] : DEFAULT_HOST;
 
         WorkerNode node = new WorkerNode(workerId, workerHost, workerPort, bootstrapHost, bootstrapPort);

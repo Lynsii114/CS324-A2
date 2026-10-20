@@ -1,7 +1,7 @@
 package com.cs324.frontend.client;
 
-import com.cs324.backend.grpc.GrpcChannels;
-import com.cs324.backend.worker.WorkerClusterConfig;
+import com.cs324.common.ClusterConfig;
+import com.cs324.common.GrpcChannels;
 import com.cs324.proto.Empty;
 import com.cs324.proto.WorkerInfo;
 import io.grpc.Status;
@@ -88,7 +88,7 @@ public final class ClusterMonitor {
     });
 
     private volatile String host = "localhost";
-    private volatile int port = com.cs324.backend.bootstrap.BootstrapServer.DEFAULT_PORT;
+    private volatile int port = EndpointDefaults.BOOTSTRAP_PORT;
     private volatile boolean active;
 
     // Server-side probe state.
@@ -305,7 +305,7 @@ public final class ClusterMonitor {
     // ---------------------------------------------------------------- helpers
 
     private int expectedClusterSize(int registered) {
-        return Math.max(Math.max(registered, WorkerClusterConfig.WORKER_COUNT), 1);
+        return Math.max(Math.max(registered, ClusterConfig.WORKER_COUNT), 1);
     }
 
     static String formatDuration(long ms) {

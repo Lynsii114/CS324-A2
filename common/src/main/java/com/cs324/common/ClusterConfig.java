@@ -1,17 +1,29 @@
-package com.cs324.backend.worker;
+package com.cs324.common;
 
 /**
- * Central configuration for the worker cluster (DistriLab / gRPC). The cluster
- * size is configurable: by default six worker nodes (IDs 1..6), and extra nodes
- * can be added on top by setting the {@code cs324.worker.count} system property -
- * the minimum is 6, so a smaller value is ignored. Each worker owns its own
- * gRPC port (5001 + id - 1) hosting both its {@code ClusterService} and
- * {@code ClientService}, so every worker runs in an isolated environment.
+ * Central configuration shared by all three deployables - the Bootstrap Node,
+ * the worker nodes and the client. The cluster size is configurable: by default
+ * six worker nodes (IDs 1..6), and extra nodes can be added on top by setting
+ * the {@code cs324.worker.count} system property - the minimum is 6, so a
+ * smaller value is ignored. Each worker owns its own gRPC port (5001 + id - 1)
+ * hosting both its {@code ClusterService} and {@code ClientService}, so every
+ * worker runs in an isolated environment.
+ *
+ * <p>The {@code cs324.worker.count} property must be identical on every JVM in
+ * the cluster (the Bootstrap Node and each worker), because it drives the
+ * cluster-complete and startup-lottery thresholds.</p>
  */
-public final class WorkerClusterConfig {
+public final class ClusterConfig {
 
     /** System property used to pick the number of worker nodes (minimum 6). */
     public static final String WORKER_COUNT_PROPERTY = "cs324.worker.count";
+
+    /**
+     * Directory (relative to the directory the worker launcher/server is started
+     * from - by convention the repository root) holding the per-worker
+     * {@code worker-<id>.log} / {@code worker-<id>.pid} files.
+     */
+    public static final String LOG_DIR = "logs";
 
     /** The smallest cluster that can be started. */
     public static final int MIN_WORKER_COUNT = 6;
@@ -26,7 +38,6 @@ public final class WorkerClusterConfig {
     public static final int LAST_WORKER_ID = FIRST_WORKER_ID + WORKER_COUNT - 1;
     public static final int BASE_WORKER_PORT = 5001;
     public static final String DEFAULT_HOST = "localhost";
-    public static final String LOG_DIR = "logs";
 
     // ---- fault tolerance knobs ----
 
@@ -48,7 +59,7 @@ public final class WorkerClusterConfig {
     /** How many replacement attempts a coordinator makes for one failed segment. */
     public static final int MAX_SEGMENT_RETRIES = 3;
 
-    private WorkerClusterConfig() {
+    private ClusterConfig() {
     }
 
     /** Reads {@code cs324.worker.count} (clamped to the 6-node minimum) at class load. */

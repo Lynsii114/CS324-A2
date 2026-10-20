@@ -1,0 +1,45 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cs324</groupId>
+        <artifactId>distributed-system</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>worker-node</artifactId>
+    <packaging>jar</packaging>
+    <name>DistriLab :: Worker Node</name>
+    <description>
+        A worker node project: WorkerServer starts one worker JVM (its own gRPC
+        port hosting ClusterService for the neighbour ring / leader election /
+        segment compute and ClientService for job submission), WorkerNode holds
+        the node logic, and WorkerClusterLauncher bulk-starts the cluster. All
+        communication with the Bootstrap Node, peer workers and clients is gRPC.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cs324</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Writes target/classpath.txt, used to launch this module and by
+                 WorkerClusterLauncher to spawn the individual worker JVMs. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>

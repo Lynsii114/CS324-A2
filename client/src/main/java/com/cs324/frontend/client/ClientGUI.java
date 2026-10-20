@@ -1,9 +1,7 @@
 package com.cs324.frontend.client;
 
-import com.cs324.backend.bootstrap.BootstrapServer;
-import com.cs324.backend.grpc.GrpcChannels;
-import com.cs324.backend.worker.WorkerClusterConfig;
-import com.cs324.backend.worker.WorkerNode;
+import com.cs324.common.GrpcChannels;
+import com.cs324.common.ClusterConfig;
 import com.cs324.frontend.ui.UITheme;
 import com.cs324.proto.BootstrapServiceGrpc;
 import com.cs324.proto.ClientServiceGrpc;
@@ -101,7 +99,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
     // ---------------------------------------------------------------- widgets
     private final TextField hostField = new TextField("localhost");
     private final TextField bootstrapPortField =
-            new TextField(String.valueOf(BootstrapServer.DEFAULT_PORT));
+            new TextField(String.valueOf(EndpointDefaults.BOOTSTRAP_PORT));
     private final Button connectButton = new Button("Connect");
     private final Label connectionStatus = new Label("Not connected");
 
@@ -152,12 +150,12 @@ public class ClientGUI implements ClusterMonitor.Listener {
 
     private ClusterMonitor monitor;
     private volatile String bootstrapHost = "localhost";
-    private volatile int bootstrapPort = BootstrapServer.DEFAULT_PORT;
+    private volatile int bootstrapPort = EndpointDefaults.BOOTSTRAP_PORT;
     private volatile BootstrapServiceGrpc.BootstrapServiceBlockingStub bootstrap;
-    private volatile int coordinatorId = WorkerNode.NO_COORDINATOR;
+    private volatile int coordinatorId = EndpointDefaults.NO_COORDINATOR;
     private volatile String coordinatorHost = null;
     private volatile int coordinatorPort = -1;
-    private volatile int clusterSize = WorkerClusterConfig.WORKER_COUNT;
+    private volatile int clusterSize = ClusterConfig.WORKER_COUNT;
 
     public static void main(String[] args) {
         Application.launch(ClientApp.class, args);
@@ -641,9 +639,9 @@ public class ClientGUI implements ClusterMonitor.Listener {
             try {
                 clusterSize = foundBootstrap.getClusterSize(Empty.getDefaultInstance()).getSize();
             } catch (Exception e) {
-                clusterSize = Math.max(registered, WorkerClusterConfig.WORKER_COUNT);
+                clusterSize = Math.max(registered, ClusterConfig.WORKER_COUNT);
             }
-            final int elected = refreshCoordinator() ? coordinatorId : WorkerNode.NO_COORDINATOR;
+            final int elected = refreshCoordinator() ? coordinatorId : EndpointDefaults.NO_COORDINATOR;
 
             // Health dashboard starts probing the server from here on.
             monitor.start(bootstrapHost, bootstrapPort);
@@ -651,16 +649,16 @@ public class ClientGUI implements ClusterMonitor.Listener {
             Platform.runLater(() -> {
                 connectButton.setDisable(false);
                 workersValue.setText(registered + "/" + clusterSize);
-                if (elected == WorkerNode.NO_COORDINATOR) {
+                if (elected == EndpointDefaults.NO_COORDINATOR) {
                     connectionStatus.setText("Connected - no coordinator yet");
-                    setCoordinatorUI(WorkerNode.NO_COORDINATOR);
+                    setCoordinatorUI(EndpointDefaults.NO_COORDINATOR);
                 } else {
                     connectionStatus.setText("Online - coordinator worker " + elected);
                     setCoordinatorUI(elected);
                 }
                 appendLog("Connected to Bootstrap Node at " + bootstrapHost + ":" + bootstrapPort
                         + " - " + registered + " worker(s) registered"
-                        + (elected == WorkerNode.NO_COORDINATOR
+                        + (elected == EndpointDefaults.NO_COORDINATOR
                                 ? ", no coordinator elected yet"
                                 : ", coordinator is worker " + elected));
             });
@@ -675,18 +673,18 @@ public class ClientGUI implements ClusterMonitor.Listener {
 
     /**
      * Asks every registered worker which coordinator it knows and returns the
-     * agreed coordinator id (or {@link WorkerNode#NO_COORDINATOR} if none).
+     * agreed coordinator id (or {@link EndpointDefaults#NO_COORDINATOR} if none).
      */
     private int findCoordinatorId(BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap) {
         List<WorkerInfo> workers =
                 currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
-        int reported = WorkerNode.NO_COORDINATOR;
+        int reported = EndpointDefaults.NO_COORDINATOR;
         for (WorkerInfo info : workers) {
             try {
                 int candidate = GrpcChannels.cluster(info.getHost(), info.getPort())
                         .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
                         .getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
-                if (candidate != WorkerNode.NO_COORDINATOR) {
+                if (candidate != EndpointDefaults.NO_COORDINATOR) {
                     reported = candidate;
                     break;
                 }
@@ -694,8 +692,8 @@ public class ClientGUI implements ClusterMonitor.Listener {
                 // worker not answering - try the next one
             }
         }
-        if (reported == WorkerNode.NO_COORDINATOR) {
-            return WorkerNode.NO_COORDINATOR;
+        if (reported == EndpointDefaults.NO_COORDINATOR) {
+            return EndpointDefaults.NO_COORDINATOR;
         }
         // Confirm the reported coordinator is alive and self-consistent; a stale
         // report can otherwise point at a worker that died mid-failover.
@@ -707,12 +705,12 @@ public class ClientGUI implements ClusterMonitor.Listener {
                 int self = GrpcChannels.cluster(info.getHost(), info.getPort())
                         .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
                         .getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
-                return self == reported ? reported : WorkerNode.NO_COORDINATOR;
+                return self == reported ? reported : EndpointDefaults.NO_COORDINATOR;
             } catch (Exception e) {
-                return WorkerNode.NO_COORDINATOR;
+                return EndpointDefaults.NO_COORDINATOR;
             }
         }
-        return WorkerNode.NO_COORDINATOR;
+        return EndpointDefaults.NO_COORDINATOR;
     }
 
     private static WorkerInfo findWorker(List<WorkerInfo> workers, int workerId) {
@@ -738,8 +736,8 @@ public class ClientGUI implements ClusterMonitor.Listener {
             List<WorkerInfo> active =
                     currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
             int coordId = findCoordinatorId(currentBootstrap);
-            if (coordId == WorkerNode.NO_COORDINATOR) {
-                setCoordinatorUI(WorkerNode.NO_COORDINATOR);
+            if (coordId == EndpointDefaults.NO_COORDINATOR) {
+                setCoordinatorUI(EndpointDefaults.NO_COORDINATOR);
                 return false;
             }
             WorkerInfo coordInfo = findWorker(active, coordId);
@@ -759,7 +757,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
     /** Updates the coordinator widgets and the monitor's probe target (FX-thread safe). */
     private void setCoordinatorUI(final int elected) {
         Platform.runLater(() -> {
-            if (elected == WorkerNode.NO_COORDINATOR) {
+            if (elected == EndpointDefaults.NO_COORDINATOR) {
                 coordinatorLabel.setText("Coordinator: none (workers are electing...)");
                 coordinatorValue.setText("None");
                 coordinatorPill.setText("ELECTING");
@@ -906,7 +904,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
             jobExecutor.submit(() -> {
                 boolean resolved = false;
                 for (int i = 0; i < MAX_RESUME_ATTEMPTS && !resolved; i++) {
-                    resolved = refreshCoordinator() && coordinatorId != WorkerNode.NO_COORDINATOR;
+                    resolved = refreshCoordinator() && coordinatorId != EndpointDefaults.NO_COORDINATOR;
                     if (!resolved) {
                         try {
                             Thread.sleep(RESOLVE_WAIT_MS);
@@ -1176,7 +1174,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
     private static final class TaskState {
         String taskId;
         int percent;
-        int coordinatorId = WorkerNode.NO_COORDINATOR;
+        int coordinatorId = EndpointDefaults.NO_COORDINATOR;
         List<WorkerRow> workers = new ArrayList<>();
         List<Integer> usedWorkers = new ArrayList<>();
         int attempt;

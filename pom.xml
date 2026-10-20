@@ -6,7 +6,23 @@
     <groupId>com.cs324</groupId>
     <artifactId>distributed-system</artifactId>
     <version>1.0-SNAPSHOT</version>
-    <packaging>jar</packaging>
+    <packaging>pom</packaging>
+
+    <!--
+      Multi-module build: each part of the cluster is its own project/Maven module
+      and the pieces only talk to each other over gRPC (distrilab.proto).
+
+        common            shared contract: proto/gRPC stubs, GrpcChannels, ClusterConfig
+        bootstrap-server  Bootstrap Node (BootstrapService)
+        worker-node       Worker nodes (ClusterService + ClientService + launcher)
+        client            JavaFX + AtlantaFX client / health dashboard
+    -->
+    <modules>
+        <module>common</module>
+        <module>bootstrap-server</module>
+        <module>worker-node</module>
+        <module>client</module>
+    </modules>
 
     <properties>
         <maven.compiler.release>17</maven.compiler.release>
@@ -20,6 +36,7 @@
         <atlantafx.version>2.0.1</atlantafx.version>
     </properties>
 
+    <!-- Every module speaks gRPC, so the transport/stub dependencies are shared. -->
     <dependencies>
         <dependency>
             <groupId>io.grpc</groupId>
@@ -47,98 +64,59 @@
             <artifactId>javax.annotation-api</artifactId>
             <version>1.3.2</version>
         </dependency>
-        <!-- JavaFX (client GUI). The platform-classified jars carry the native
-             libraries; override javafx.platform (win / mac / mac-aarch64) to
-             target a different OS. -->
-        <dependency>
-            <groupId>org.openjfx</groupId>
-            <artifactId>javafx-base</artifactId>
-            <version>${javafx.version}</version>
-            <classifier>${javafx.platform}</classifier>
-        </dependency>
-        <dependency>
-            <groupId>org.openjfx</groupId>
-            <artifactId>javafx-graphics</artifactId>
-            <version>${javafx.version}</version>
-            <classifier>${javafx.platform}</classifier>
-        </dependency>
-        <dependency>
-            <groupId>org.openjfx</groupId>
-            <artifactId>javafx-controls</artifactId>
-            <version>${javafx.version}</version>
-            <classifier>${javafx.platform}</classifier>
-        </dependency>
-        <!-- AtlantaFX: modern CSS theme/skin library on top of JavaFX -->
-        <dependency>
-            <groupId>io.github.mkpaz</groupId>
-            <artifactId>atlantafx-base</artifactId>
-            <version>${atlantafx.version}</version>
-        </dependency>
     </dependencies>
 
     <build>
-        <extensions>
-            <extension>
-                <groupId>kr.motd.maven</groupId>
-                <artifactId>os-maven-plugin</artifactId>
-                <version>1.7.1</version>
-            </extension>
-        </extensions>
+        <pluginManagement>
+            <plugins>
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-compiler-plugin</artifactId>
+                    <version>3.13.0</version>
+                    <configuration>
+                        <release>17</release>
+                    </configuration>
+                </plugin>
 
-        <plugins>
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.13.0</version>
-                <configuration>
-                    <release>17</release>
-                </configuration>
-            </plugin>
+                <!-- Generates the Java gRPC stubs from src/main/proto/<file>.proto
+                     (configured in the common module, the only one with .proto files). -->
+                <plugin>
+                    <groupId>org.xolstice.maven.plugins</groupId>
+                    <artifactId>protobuf-maven-plugin</artifactId>
+                    <version>0.6.1</version>
+                    <configuration>
+                        <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
+                        <pluginId>grpc-java</pluginId>
+                        <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
+                    </configuration>
+                </plugin>
 
-            <plugin>
-                <groupId>org.xolstice.maven.plugins</groupId>
-                <artifactId>protobuf-maven-plugin</artifactId>
-                <version>0.6.1</version>
-                <configuration>
-                    <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
-                    <pluginId>grpc-java</pluginId>
-                    <pluginArtifact>io.grpc:protoc-gen-grpc-java:${grpc.version}:exe:${os.detected.classifier}</pluginArtifact>
-                </configuration>
-                <executions>
-                    <execution>
-                        <goals>
-                            <goal>compile</goal>
-                            <goal>compile-custom</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
+                <!-- Writes target/classpath.txt so each module can be launched with
+                     java -cp "target/classes:$(cat target/classpath.txt)" <MainClass>. -->
+                <plugin>
+                    <groupId>org.apache.maven.plugins</groupId>
+                    <artifactId>maven-dependency-plugin</artifactId>
+                    <version>3.6.1</version>
+                    <executions>
+                        <execution>
+                            <id>build-classpath</id>
+                            <phase>process-classes</phase>
+                            <goals>
+                                <goal>build-classpath</goal>
+                            </goals>
+                            <configuration>
+                                <outputFile>${project.build.directory}/classpath.txt</outputFile>
+                            </configuration>
+                        </execution>
+                    </executions>
+                </plugin>
 
-            <!-- Writes target/classpath.txt so the WorkerClusterLauncher can spawn
-                 worker JVMs with the full gRPC/protobuf dependency classpath. -->
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-dependency-plugin</artifactId>
-                <version>3.6.1</version>
-                <executions>
-                    <execution>
-                        <id>build-classpath</id>
-                        <phase>process-classes</phase>
-                        <goals>
-                            <goal>build-classpath</goal>
-                        </goals>
-                        <configuration>
-                            <outputFile>${project.build.directory}/classpath.txt</outputFile>
-                        </configuration>
-                    </execution>
-                </executions>
-            </plugin>
-
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>exec-maven-plugin</artifactId>
-                <version>3.5.0</version>
-            </plugin>
-        </plugins>
+                <plugin>
+                    <groupId>org.codehaus.mojo</groupId>
+                    <artifactId>exec-maven-plugin</artifactId>
+                    <version>3.5.0</version>
+                </plugin>
+            </plugins>
+        </pluginManagement>
     </build>
 </project>

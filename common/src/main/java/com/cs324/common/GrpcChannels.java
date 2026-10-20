@@ -1,4 +1,4 @@
-package com.cs324.backend.grpc;
+package com.cs324.common;
 
 import com.cs324.proto.BootstrapServiceGrpc;
 import com.cs324.proto.ClientServiceGrpc;

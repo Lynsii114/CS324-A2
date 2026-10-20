@@ -1,7 +1,7 @@
 package com.cs324.backend.bootstrap;
 
-import com.cs324.backend.grpc.GrpcChannels;
-import com.cs324.backend.worker.WorkerClusterConfig;
+import com.cs324.common.ClusterConfig;
+import com.cs324.common.GrpcChannels;
 import com.cs324.proto.ActiveTasksResponse;
 import com.cs324.proto.ActiveWorkersResponse;
 import com.cs324.proto.BootstrapServiceGrpc;
@@ -54,10 +54,10 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
         synchronized (this) {
             activeWorkers.put(request.getWorkerId(), request);
             lastSeenAt.put(request.getWorkerId(), System.currentTimeMillis());
-            if (clusterCompleteAt == 0L && activeWorkers.size() >= WorkerClusterConfig.WORKER_COUNT) {
+            if (clusterCompleteAt == 0L && activeWorkers.size() >= ClusterConfig.WORKER_COUNT) {
                 clusterCompleteAt = System.currentTimeMillis();
-                System.out.println("[Bootstrap] Cluster complete: " + WorkerClusterConfig.WORKER_COUNT
-                        + "/" + WorkerClusterConfig.WORKER_COUNT + " workers registered");
+                System.out.println("[Bootstrap] Cluster complete: " + ClusterConfig.WORKER_COUNT
+                        + "/" + ClusterConfig.WORKER_COUNT + " workers registered");
             }
         }
         System.out.println("[Bootstrap] Registered worker: " + describe(request));
@@ -131,14 +131,14 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
             Integer existing = priorityTable.get(workerId);
             if (existing != null) {
                 priority = existing;
-            } else if (priorityTable.size() >= WorkerClusterConfig.WORKER_COUNT) {
+            } else if (priorityTable.size() >= ClusterConfig.WORKER_COUNT) {
                 priority = -1;
             } else {
-                priority = WorkerClusterConfig.WORKER_COUNT - priorityTable.size(); // N, N-1, ..., 1
+                priority = ClusterConfig.WORKER_COUNT - priorityTable.size(); // N, N-1, ..., 1
                 priorityTable.put(workerId, priority);
                 System.out.println("[Bootstrap] Lottery claim by worker " + workerId
                         + " -> startup priority " + priority
-                        + " (claims so far: " + priorityTable.size() + "/" + WorkerClusterConfig.WORKER_COUNT + ")");
+                        + " (claims so far: " + priorityTable.size() + "/" + ClusterConfig.WORKER_COUNT + ")");
             }
         }
         responseObserver.onNext(LotteryClaimResponse.newBuilder().setPriority(priority).build());
@@ -170,7 +170,7 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
 
     @Override
     public void getClusterSize(Empty request, StreamObserver<ClusterSizeResponse> responseObserver) {
-        responseObserver.onNext(ClusterSizeResponse.newBuilder().setSize(WorkerClusterConfig.WORKER_COUNT).build());
+        responseObserver.onNext(ClusterSizeResponse.newBuilder().setSize(ClusterConfig.WORKER_COUNT).build());
         responseObserver.onCompleted();
     }
 
@@ -252,7 +252,7 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
         if (last == null) {
             return false;
         }
-        return System.currentTimeMillis() - last < WorkerClusterConfig.HEARTBEAT_TIMEOUT_MS;
+        return System.currentTimeMillis() - last < ClusterConfig.HEARTBEAT_TIMEOUT_MS;
     }
 
     public List<WorkerInfo> onlineWorkers() {
