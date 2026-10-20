@@ -1,0 +1,72 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.cs324</groupId>
+        <artifactId>distributed-system</artifactId>
+        <version>1.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>client</artifactId>
+    <packaging>jar</packaging>
+    <name>DistriLab :: Client</name>
+    <description>
+        The standalone client project: a JavaFX + AtlantaFX GUI that submits jobs
+        to whichever worker currently holds the coordinator role (gRPC
+        ClientService, server-streaming progress) plus a background health monitor
+        that probes the Bootstrap Node and every worker over gRPC for the live
+        dashboard. It never links against the server code - only against the
+        shared gRPC contract in `common`.
+    </description>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.cs324</groupId>
+            <artifactId>common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <!-- JavaFX (client GUI). The platform-classified jars carry the native
+             libraries; override javafx.platform (win / mac / mac-aarch64) to
+             target a different OS. -->
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-base</artifactId>
+            <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-graphics</artifactId>
+            <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
+        </dependency>
+        <dependency>
+            <groupId>org.openjfx</groupId>
+            <artifactId>javafx-controls</artifactId>
+            <version>${javafx.version}</version>
+            <classifier>${javafx.platform}</classifier>
+        </dependency>
+        <!-- AtlantaFX: modern CSS theme/skin library on top of JavaFX -->
+        <dependency>
+            <groupId>io.github.mkpaz</groupId>
+            <artifactId>atlantafx-base</artifactId>
+            <version>${atlantafx.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Writes target/classpath.txt for `java -cp "target/classes:$(cat target/classpath.txt)"`. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
