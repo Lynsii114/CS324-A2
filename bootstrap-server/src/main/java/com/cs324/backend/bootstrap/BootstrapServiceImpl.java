@@ -176,13 +176,28 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
 
     // ------------------------------------------------------------------ ledger
 
+    /**
+     * Task id + coordinator id form the ledger key. Several clients submit jobs
+     * concurrently, and a client that reconnects after a coordinator failover
+     * re-submits the <i>same</i> task id ({@code JobRequest.resume_task_id});
+     * scoping entries by the coordinator that owns them keeps those retries from
+     * overwriting each other or the records of a different client's job.
+     */
+    private static String ledgerKey(String taskId, int coordinatorId) {
+        return coordinatorId + "/" + taskId;
+    }
+
+    private static String ledgerKey(TaskLedgerEntry entry) {
+        return ledgerKey(entry.getTaskId(), entry.getCoordinatorId());
+    }
+
     @Override
     public void recordTaskStart(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
         if (request.getTaskId().isBlank()) {
             responseObserver.onError(Status.INVALID_ARGUMENT.withDescription("task id must not be blank").asException());
             return;
         }
-        taskLedger.put(request.getTaskId(), request);
+        taskLedger.put(ledgerKey(request), request);
         responseObserver.onNext(Empty.getDefaultInstance());
         responseObserver.onCompleted();
     }
@@ -190,7 +205,8 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
     @Override
     public void recordSegmentUpdate(SegmentUpdate request, StreamObserver<Empty> responseObserver) {
         synchronized (this) {
-            TaskLedgerEntry existing = taskLedger.get(request.getTaskId());
+            String key = ledgerKey(request.getTaskId(), request.getCoordinatorId());
+            TaskLedgerEntry existing = taskLedger.get(key);
             if (existing == null) {
                 responseObserver.onNext(Empty.getDefaultInstance());
                 responseObserver.onCompleted();
@@ -204,7 +220,7 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
                     .setFailed(request.getFailed())
                     .build();
             TaskLedgerEntry updated = existing.toBuilder().putSegments(request.getSegmentIndex(), record).build();
-            taskLedger.put(updated.getTaskId(), updated);
+            taskLedger.put(key, updated);
         }
         responseObserver.onNext(Empty.getDefaultInstance());
         responseObserver.onCompleted();
@@ -212,25 +228,48 @@ public class BootstrapServiceImpl extends BootstrapServiceGrpc.BootstrapServiceI
 
     @Override
     public void recordTaskCompletion(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
-        taskLedger.put(request.getTaskId(), request.toBuilder().setStatus(TaskStatus.TASK_DONE).build());
+        taskLedger.put(ledgerKey(request), request.toBuilder().setStatus(TaskStatus.TASK_DONE).build());
         System.out.println("[Bootstrap] Ledger: task " + shortId(request.getTaskId()) + " DONE (client "
-                + request.getClientId() + ", result=" + request.getFinalResult() + ")");
+                + request.getClientId() + ", coordinator " + request.getCoordinatorId()
+                + ", result=" + request.getFinalResult() + ")");
         responseObserver.onNext(Empty.getDefaultInstance());
         responseObserver.onCompleted();
     }
 
     @Override
     public void recordTaskFailure(TaskLedgerEntry request, StreamObserver<Empty> responseObserver) {
-        taskLedger.put(request.getTaskId(), request.toBuilder().setStatus(TaskStatus.TASK_FAILED).build());
+        taskLedger.put(ledgerKey(request), request.toBuilder().setStatus(TaskStatus.TASK_FAILED).build());
         responseObserver.onNext(Empty.getDefaultInstance());
         responseObserver.onCompleted();
     }
 
     @Override
     public void getTaskLedger(TaskQuery request, StreamObserver<TaskLedgerEntry> responseObserver) {
-        TaskLedgerEntry entry = taskLedger.get(request.getTaskId());
+        TaskLedgerEntry entry = lookupTask(request.getTaskId(), request.getCoordinatorId());
         responseObserver.onNext(entry == null ? TaskLedgerEntry.getDefaultInstance() : entry);
         responseObserver.onCompleted();
+    }
+
+    /**
+     * Looks a task up by (coordinator id, task id). A {@code coordinatorId} of
+     * {@code 0} means "any coordinator": a client that reconnects after failover
+     * asks the <i>new</i> coordinator to resume a task the <i>previous</i>
+     * coordinator started, so the exact owner is not known at that point and the
+     * lookup has to search by task id alone.
+     */
+    private TaskLedgerEntry lookupTask(String taskId, int coordinatorId) {
+        if (taskId == null || taskId.isBlank()) {
+            return null;
+        }
+        if (coordinatorId != 0) {
+            return taskLedger.get(ledgerKey(taskId, coordinatorId));
+        }
+        for (TaskLedgerEntry entry : taskLedger.values()) {
+            if (taskId.equals(entry.getTaskId())) {
+                return entry;
+            }
+        }
+        return null;
     }
 
     @Override

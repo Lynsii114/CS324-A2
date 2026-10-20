@@ -147,6 +147,8 @@ public class ClientGUI implements ClusterMonitor.Listener {
     private final AtomicInteger jobsFailed = new AtomicInteger(0);
     private final Map<Integer, TaskState> taskStates = new ConcurrentHashMap<>();
     private final String clientId = "client-" + UUID.randomUUID().toString().substring(0, 8);
+    /** Display name of this GUI instance - several clients run at once and share one cluster. */
+    private volatile String instanceName = "Client";
 
     private ClusterMonitor monitor;
     private volatile String bootstrapHost = "localhost";
@@ -177,7 +179,11 @@ public class ClientGUI implements ClusterMonitor.Listener {
         }
     }
 
-    /** Builds and shows the UI; {@code rawParams} carries the optional {@code [port]} argument. */
+    /**
+     * Builds and shows the UI. {@code rawParams} carries the optional
+     * {@code [bootstrapPort] [instanceName]} arguments, so several client windows
+     * can be started side by side and told apart at a glance.
+     */
     void start(Stage stage, List<String> rawParams) {
         if (!rawParams.isEmpty()) {
             try {
@@ -186,6 +192,9 @@ public class ClientGUI implements ClusterMonitor.Listener {
             } catch (NumberFormatException ignored) {
                 // not a port number - keep the default
             }
+        }
+        if (rawParams.size() > 1 && !rawParams.get(1).isBlank()) {
+            instanceName = rawParams.get(1).trim();
         }
         UITheme.install();
         monitor = new ClusterMonitor(this);
@@ -197,7 +206,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
 
         Scene scene = new Scene(root, 1360, 940);
         UITheme.apply(scene);
-        stage.setTitle("Distributed Cluster Client - " + clientId);
+        stage.setTitle(instanceName + " - Distributed Cluster Client - " + clientId);
         stage.setScene(scene);
         stage.setMinWidth(1080);
         stage.setMinHeight(760);
@@ -674,8 +683,13 @@ public class ClientGUI implements ClusterMonitor.Listener {
     /**
      * Asks every registered worker which coordinator it knows and returns the
      * agreed coordinator id (or {@link EndpointDefaults#NO_COORDINATOR} if none).
+     *
+     * @param avoidWorkerId skip this worker (the one that just rejected a
+     *                      submission, whose term is over) so a retry never
+     *                      resolves the same just-ended coordinator again.
      */
-    private int findCoordinatorId(BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap) {
+    private int findCoordinatorId(BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap,
+                                  int avoidWorkerId) {
         List<WorkerInfo> workers =
                 currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
         int reported = EndpointDefaults.NO_COORDINATOR;
@@ -684,7 +698,7 @@ public class ClientGUI implements ClusterMonitor.Listener {
                 int candidate = GrpcChannels.cluster(info.getHost(), info.getPort())
                         .withDeadlineAfter(1500, TimeUnit.MILLISECONDS)
                         .getCurrentCoordinatorId(Empty.getDefaultInstance()).getValue();
-                if (candidate != EndpointDefaults.NO_COORDINATOR) {
+                if (candidate != EndpointDefaults.NO_COORDINATOR && candidate != avoidWorkerId) {
                     reported = candidate;
                     break;
                 }
@@ -726,8 +740,14 @@ public class ClientGUI implements ClusterMonitor.Listener {
      * Re-queries the Bootstrap Node for the currently elected coordinator and
      * points the client's submit path at it. Used on connect and when a stream
      * breaks because a term ended or the coordinator died.
+     *
+     * @param avoidWorkerId a worker the client must not resolve again (the one
+     *                      that just rejected the job), or
+     *                      {@link EndpointDefaults#NO_COORDINATOR}. Without it a
+     *                      retry could pick the coordinator whose term has only
+     *                      just ended and be rejected a second time.
      */
-    private boolean refreshCoordinator() {
+    private boolean refreshCoordinator(int avoidWorkerId) {
         final BootstrapServiceGrpc.BootstrapServiceBlockingStub currentBootstrap = bootstrap;
         if (currentBootstrap == null) {
             return false;
@@ -735,9 +755,8 @@ public class ClientGUI implements ClusterMonitor.Listener {
         try {
             List<WorkerInfo> active =
                     currentBootstrap.getActiveWorkers(Empty.getDefaultInstance()).getWorkersList();
-            int coordId = findCoordinatorId(currentBootstrap);
+            int coordId = findCoordinatorId(currentBootstrap, avoidWorkerId);
             if (coordId == EndpointDefaults.NO_COORDINATOR) {
-                setCoordinatorUI(EndpointDefaults.NO_COORDINATOR);
                 return false;
             }
             WorkerInfo coordInfo = findWorker(active, coordId);
@@ -752,6 +771,10 @@ public class ClientGUI implements ClusterMonitor.Listener {
         } catch (Exception e) {
             return false;
         }
+    }
+
+    private boolean refreshCoordinator() {
+        return refreshCoordinator(EndpointDefaults.NO_COORDINATOR);
     }
 
     /** Updates the coordinator widgets and the monitor's probe target (FX-thread safe). */
@@ -901,10 +924,15 @@ public class ClientGUI implements ClusterMonitor.Listener {
             appendLog("Stream interrupted (attempt " + state.attempt + "): " + message
                     + " - re-resolving the coordinator and resuming job " + jobId);
             final TaskState captured = state;
+            // The coordinator that rejected this job has ended its term; resolving
+            // it again would be rejected a second time, so skip it while retrying.
+            final int rejectedBy = message != null && message.contains("Coordinator term ended")
+                    ? captured.coordinatorId
+                    : EndpointDefaults.NO_COORDINATOR;
             jobExecutor.submit(() -> {
                 boolean resolved = false;
                 for (int i = 0; i < MAX_RESUME_ATTEMPTS && !resolved; i++) {
-                    resolved = refreshCoordinator() && coordinatorId != EndpointDefaults.NO_COORDINATOR;
+                    resolved = refreshCoordinator(rejectedBy) && coordinatorId != EndpointDefaults.NO_COORDINATOR;
                     if (!resolved) {
                         try {
                             Thread.sleep(RESOLVE_WAIT_MS);

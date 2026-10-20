@@ -51,7 +51,9 @@ The cluster is designed to keep serving jobs while workers die and rejoin:
   **does not spawn worker processes**: each worker is started in its own terminal.
 - **Worker nodes** (IDs `1..N`, gRPC ports `5001..5000+N`) register with the Bootstrap Node, are
   linked into a small neighbour ring, and automatically **elect a coordinator**. The coordinator
-  serves **at most 5 client jobs** per term, then a re-election rotates to the least-loaded worker.
+  serves **at most 5 client jobs** per term, then a re-election rotates to the least-loaded worker;
+  a client whose submission arrives after the term ends transparently **resumes its job on the new
+  coordinator**. Multiple clients can drive this concurrently.
 - Every gRPC channel is cached per `host:port` and re-used by all components
   (`com.cs324.common.GrpcChannels`, in the `common` module), with a 30 s keep-alive.
 - The **client GUI** watches the whole system with a background health monitor
@@ -83,7 +85,7 @@ Main packages / Maven projects:
 | `common/` | `distrilab.proto` (gRPC contract: `BootstrapService`, `ClusterService`, `ClientService`; messages incl. `SegmentRecord`), `com.cs324.common.GrpcChannels` (cached `ManagedChannel`s per target, keep-alive policy), `com.cs324.common.ClusterConfig` (ports, cluster size, fault-tolerance timeouts) |
 | `bootstrap-server/` | `com.cs324.backend.bootstrap.BootstrapServer` (terminal entry point — prints per-worker start commands, spawns nothing), `BootstrapServiceImpl` (membership, lottery, task/segment ledger) |
 | `worker-node/` | `com.cs324.backend.worker.WorkerNode` (election, coordinator duties, segment executor, retry logic), `WorkerServer`, `WorkerClusterService`, `WorkerClientService`, `WorkerClusterLauncher` (optional bulk start/stop tool), `BootstrapEndpoint` (the one address a worker needs from the bootstrap) |
-| `client/` | `com.cs324.frontend.client.ClientGUI` (JavaFX client + dashboard), `ClusterMonitor` (background health probes driving the dashboard), `EndpointDefaults`; `com.cs324.frontend.ui.UITheme` (AtlantaFX `PrimerLight` base theme + project stylesheet layer); `src/main/resources/.../client-theme.css` (enlarged typography, cards, status pills, event timeline) |
+| `client/` | `com.cs324.frontend.client.ClientGUI` (JavaFX client + dashboard), `ClientLauncher` (opens several client windows at once), `ClusterMonitor` (background health probes driving the dashboard), `EndpointDefaults`; `com.cs324.frontend.ui.UITheme` (AtlantaFX `PrimerLight` base theme + project stylesheet layer); `src/main/resources/.../client-theme.css` (enlarged typography, cards, status pills, event timeline) |
 
 Dependency direction: `bootstrap-server`, `worker-node` and `client` each depend only on `common`.
 They never link against each other — cross-project communication is entirely gRPC.
@@ -207,10 +209,33 @@ lottery runs; within ~10 s the workers elect a coordinator.
 ```bash
 cd client
 java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.frontend.client.ClientGUI
-# optional:  ClientGUI [bootstrapPort]
+# optional:  ClientGUI [bootstrapPort] [instanceName]
 ```
 
 Click **Connect** — the dashboard starts probing the cluster and resolves the coordinator.
+
+### Several clients at once
+
+The cluster serves **many clients concurrently** — each client is just a separate gRPC consumer of
+the elected coordinator, so nothing is shared between them beyond the cluster itself:
+
+- Every client gets its own **client id**, its own task list, its own job stream, and its own
+  progress/result rendering.
+- Concurrent submissions are counted against the coordinator's term (`COORDINATOR_TERM_LIMIT`);
+  a client whose job lands after the term ends **re-resolves the new coordinator and resumes the
+  same task id** transparently.
+- The bootstrap ledger is keyed by **(coordinator id, task id)**, so two clients that happen to
+  reuse a task id (e.g. both resuming across a failover) never overwrite each other's records.
+
+To open several windows at once, `ClientLauncher` (in `client/`) spawns them for you:
+
+```bash
+cd client
+java -cp "target/classes:$(cat target/classpath.txt)" com.cs324.frontend.client.ClientLauncher 3
+# ClientLauncher [count] [bootstrapHost] [bootstrapPort]   (count defaults to 2, capped at 8)
+```
+
+Each window is titled `Client N - ...` so you can tell them apart; press **Connect** in each.
 
 ### Optional: bulk launcher (bash convenience, not a GUI)
 

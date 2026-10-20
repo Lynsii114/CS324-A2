@@ -197,6 +197,10 @@ message SegmentRecord {
 }
 
 // Incremental segment update pushed by the coordinator while a task runs.
+// coordinator_id scopes the update to the coordinator that owns the task: a
+// client that reconnects after a coordinator failover re-submits the same
+// task_id, so without it two coordinators servicing concurrent clients could
+// update each other's ledger entries.
 message SegmentUpdate {
   string task_id = 1;
   int32 segment_index = 2;
@@ -204,10 +208,16 @@ message SegmentUpdate {
   bool completed = 4;
   int64 partial = 5;
   bool failed = 6;
+  int32 coordinator_id = 7;
 }
 
+// Ledger lookup by (coordinator_id, task_id) - the same task_id may exist for
+// more than one coordinator while a failover retry is in flight. A
+// coordinator_id of 0 means "any coordinator", used when a client resumes a task
+// on a new coordinator without knowing which one originally started it.
 message TaskQuery {
   string task_id = 1;
+  int32 coordinator_id = 2;
 }
 
 message ActiveTasksResponse {
